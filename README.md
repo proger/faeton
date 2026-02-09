@@ -33,7 +33,7 @@ What it does:
 - records audio and screen in multiple resolutions
 - asks Codex for advice
 - puts advice on a HUD
-- speaks advice out lud
+- speaks advice out loud
 
 Game logs are written to:
 
