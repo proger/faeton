@@ -69,6 +69,10 @@ Outputs are written to:
 exp/<timestamp>_<tag>/
 ```
 
+## Demo
+
+[![Demo](exp/demo_preview.jpg)](exp/demo.mp4)
+
 ## Replay Decode
 
 Dump raw replay events with Manta:
