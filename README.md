@@ -51,10 +51,10 @@ exp/<timestamp>_<tag>/
 
 ## Replay Decode
 
-Dump raw replay events with Manta (you need to download replay after the game):
+Dump raw replay events with Manta (you need to click "download replay" on the post-game screen):
 
 ```bash
-./manta_run_decoder <replay.dem>  #  they are in ~/Library/Application Support/Steam/steamapps/common/dota 2 beta/game/dota/replays
+./manta_run_decoder <replay.dem>  #  they should be copied from ~/Library/Application Support/Steam/steamapps/common/dota 2 beta/game/dota/replays when you ^C
 ```
 
 Optional flags:
