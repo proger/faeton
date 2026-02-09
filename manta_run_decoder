@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ECLIPSE_FLAG=""
+INCLUDE_BINARY_FLAG=""
+POSITIONAL=()
+for arg in "$@"; do
+  if [[ "$arg" == "-eclipse" ]]; then
+    ECLIPSE_FLAG="-eclipse"
+  elif [[ "$arg" == "-include-binary" ]]; then
+    INCLUDE_BINARY_FLAG="-include-binary"
+  else
+    POSITIONAL+=("$arg")
+  fi
+done
+set -- "${POSITIONAL[@]}"
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: manta_run_decoder [-eclipse] [-include-binary] <replay.dem> [output.jsonl|-]" >&2
+  exit 1
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DECODER_DIR="$ROOT_DIR/manta_decoder"
+CACHE_DIR="$ROOT_DIR/.cache"
+BIN_PATH="$CACHE_DIR/manta_run_decoder"
+DEM_PATH="$1"
+OUT_PATH="${2:--}"
+
+mkdir -p "$CACHE_DIR"
+
+if [[ ! -x "$BIN_PATH" || "$DECODER_DIR/main.go" -nt "$BIN_PATH" || "$DECODER_DIR/go.mod" -nt "$BIN_PATH" || "$DECODER_DIR/go.sum" -nt "$BIN_PATH" ]]; then
+  (cd "$DECODER_DIR" && go build -o "$BIN_PATH" .)
+fi
+
+exec "$BIN_PATH" $ECLIPSE_FLAG $INCLUDE_BINARY_FLAG -dem "$DEM_PATH" -out "$OUT_PATH"
