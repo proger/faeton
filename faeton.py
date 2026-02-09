@@ -15,6 +15,7 @@ PREFERRED_MIC_HINTS = ("steinberg ur22c", "ur22c")
 CHUNK_SECONDS = 10
 SCREEN_INPUT_PIXEL_FORMAT = "nv12"
 SAY_RATE_WPM = 350
+SAY_VOICE = "Grandpa"
 WHISPER_CONTEXT_SECONDS = 30
 ADVICE_PROMPT_TEMPLATE = """You are coaching a Dota 2 player.
 Use the attached screenshot plus the speech transcript context.
@@ -32,9 +33,6 @@ All speech so far:
 
 
 def load_whisper_model():
-    vendor_dir = pathlib.Path(__file__).resolve().parent / "vendor" / "whisper"
-    if str(vendor_dir) not in sys.path:
-        sys.path.insert(0, str(vendor_dir))
     import torch
     import whisper
     from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
@@ -366,7 +364,7 @@ def stop_persistent_overlay(overlay_proc):
 
 
 def speak_text(text):
-    subprocess.run(["say", "-r", str(SAY_RATE_WPM), text], check=False)
+    subprocess.run(["say", "-v", SAY_VOICE, "-r", str(SAY_RATE_WPM), text], check=False)
 
 
 def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
@@ -478,11 +476,6 @@ def process_finished_chunks(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--screen",
-        action="store_true",
-        help="Also record screen video chunks with hardware acceleration.",
-    )
-    parser.add_argument(
         "--tag",
         type=str,
         default="",
@@ -576,92 +569,91 @@ def main():
     print("Transcribing each completed chunk with Whisper Turbo (Torch API).")
     overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir)
     screen_proc = None
-    if args.screen:
-        screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
-        screen_segment_pattern_1fps = str(chunks_dir / "%06d_down4_1fps.mp4")
-        latest_frame_path = str(chunks_dir / "latest_down4_1fps.png")
-        video_devices = list_avfoundation_video_devices()
-        if not video_devices:
-            raise SystemExit("No AVFoundation video devices found for screen recording.")
-        screen_device = pick_device(video_devices, ("capture screen", "screen"))
-        if screen_device is None:
-            screen_device = video_devices[0]
-        screen_id, screen_name = screen_device
-        screen_command = [
-            "ffmpeg",
-            "-f",
-            "avfoundation",
-            "-pixel_format",
-            SCREEN_INPUT_PIXEL_FORMAT,
-            "-framerate",
-            "30",
-            "-i",
-            f"{screen_id}:none",
-            "-filter_complex",
-            (
-                "[0:v]split=3[v30][v1][v1live];"
-                "[v30]fps=30,scale=trunc(iw/8):trunc(ih/8)[v30out];"
-                "[v1]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1out];"
-                "[v1live]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1liveout]"
-            ),
-            "-map",
-            "[v30out]",
-            "-c:v",
-            "h264_videotoolbox",
-            "-b:v",
-            "8M",
-            "-maxrate",
-            "12M",
-            "-bufsize",
-            "24M",
-            "-g",
-            "60",
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{CHUNK_SECONDS})",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(CHUNK_SECONDS),
-            "-reset_timestamps",
-            "1",
-            screen_segment_pattern_30fps,
-            "-map",
-            "[v1out]",
-            "-c:v",
-            "h264_videotoolbox",
-            "-b:v",
-            "2M",
-            "-maxrate",
-            "3M",
-            "-bufsize",
-            "6M",
-            "-g",
-            "30",
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{CHUNK_SECONDS})",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(CHUNK_SECONDS),
-            "-reset_timestamps",
-            "1",
-            screen_segment_pattern_1fps,
-            "-map",
-            "[v1liveout]",
-            "-f",
-            "image2",
-            "-update",
-            "1",
-            "-q:v",
-            "2",
-            latest_frame_path,
-        ]
-        print(
-            "Screen chunks "
-            f"({screen_name}): {chunks_dir} "
-            "(*_down8_30fps.mp4, *_down4_1fps.mp4, latest_down4_1fps.png)"
-        )
-        screen_proc = subprocess.Popen(screen_command)
+    screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
+    screen_segment_pattern_1fps = str(chunks_dir / "%06d_down4_1fps.mp4")
+    latest_frame_path = str(chunks_dir / "latest_down4_1fps.png")
+    video_devices = list_avfoundation_video_devices()
+    if not video_devices:
+        raise SystemExit("No AVFoundation video devices found for screen recording.")
+    screen_device = pick_device(video_devices, ("capture screen", "screen"))
+    if screen_device is None:
+        screen_device = video_devices[0]
+    screen_id, screen_name = screen_device
+    screen_command = [
+        "ffmpeg",
+        "-f",
+        "avfoundation",
+        "-pixel_format",
+        SCREEN_INPUT_PIXEL_FORMAT,
+        "-framerate",
+        "30",
+        "-i",
+        f"{screen_id}:none",
+        "-filter_complex",
+        (
+            "[0:v]split=3[v30][v1][v1live];"
+            "[v30]fps=30,scale=trunc(iw/8):trunc(ih/8)[v30out];"
+            "[v1]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1out];"
+            "[v1live]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1liveout]"
+        ),
+        "-map",
+        "[v30out]",
+        "-c:v",
+        "h264_videotoolbox",
+        "-b:v",
+        "8M",
+        "-maxrate",
+        "12M",
+        "-bufsize",
+        "24M",
+        "-g",
+        "60",
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{CHUNK_SECONDS})",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(CHUNK_SECONDS),
+        "-reset_timestamps",
+        "1",
+        screen_segment_pattern_30fps,
+        "-map",
+        "[v1out]",
+        "-c:v",
+        "h264_videotoolbox",
+        "-b:v",
+        "2M",
+        "-maxrate",
+        "3M",
+        "-bufsize",
+        "6M",
+        "-g",
+        "30",
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{CHUNK_SECONDS})",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(CHUNK_SECONDS),
+        "-reset_timestamps",
+        "1",
+        screen_segment_pattern_1fps,
+        "-map",
+        "[v1liveout]",
+        "-f",
+        "image2",
+        "-update",
+        "1",
+        "-q:v",
+        "2",
+        latest_frame_path,
+    ]
+    print(
+        "Screen chunks "
+        f"({screen_name}): {chunks_dir} "
+        "(*_down8_30fps.mp4, *_down4_1fps.mp4, latest_down4_1fps.png)"
+    )
+    screen_proc = subprocess.Popen(screen_command)
     print("Press Ctrl-C to stop.")
     proc = subprocess.Popen(command)
     processed_chunks = set()
@@ -677,7 +669,7 @@ def main():
                 chunks_dir,
                 processed_chunks,
                 overlay_text_path,
-                with_screen_advice=args.screen,
+                with_screen_advice=True,
                 final_pass=False,
             )
             time.sleep(1)
@@ -702,7 +694,7 @@ def main():
             chunks_dir,
             processed_chunks,
             overlay_text_path,
-            with_screen_advice=args.screen,
+            with_screen_advice=True,
             final_pass=True,
         )
         stop_persistent_overlay(overlay_proc)
