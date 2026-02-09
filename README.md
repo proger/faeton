@@ -2,6 +2,8 @@
 
 faeton is a legendary dota coach.
 
+[![Demo](exp/demo_preview.jpg)](exp/demo.mp4)
+
 ## Install
 
 1. Install system dependencies:
@@ -68,10 +70,6 @@ Outputs are written to:
 ```text
 exp/<timestamp>_<tag>/
 ```
-
-## Demo
-
-[![Demo](exp/demo_preview.jpg)](exp/demo.mp4)
 
 ## Replay Decode
 
