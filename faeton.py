@@ -15,6 +15,7 @@ PREFERRED_MIC_HINTS = ("steinberg ur22c", "ur22c")
 CHUNK_SECONDS = 30
 SCREEN_INPUT_PIXEL_FORMAT = "nv12"
 SAY_RATE_WPM = 350
+DOTA_REPLAY_DIR = pathlib.Path.home() / "Library/Application Support/Steam/steamapps/common/dota 2 beta/game/dota/replays"
 ADVICE_PROMPT_TEMPLATE = """You are coaching a Dota 2 player.
 Use the attached screenshot plus the speech transcript context.
 Explain what is happening right now and the single next best action.
@@ -402,6 +403,49 @@ def process_finished_chunks(
         )
 
 
+def copy_session_replay_to_exp(session_start_unix, chunks_dir):
+    replay_dir = DOTA_REPLAY_DIR
+    if not replay_dir.is_dir():
+        print(f"Replay copy: replay directory not found: {replay_dir}", flush=True)
+        return
+
+    # Replay files may finalize shortly after capture ends; poll briefly.
+    latest = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        candidates = [
+            p
+            for p in replay_dir.glob("*.dem")
+            if p.is_file() and p.stat().st_mtime >= (session_start_unix - 2)
+        ]
+        if candidates:
+            latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        if latest is not None:
+            break
+        time.sleep(1)
+
+    if latest is None:
+        print(
+            "Replay copy: no .dem file found in replay folder for this session.",
+            flush=True,
+        )
+        return
+
+    dest = chunks_dir / latest.name
+    if dest.exists():
+        stem = latest.stem
+        suffix = latest.suffix
+        n = 1
+        while True:
+            candidate = chunks_dir / f"{stem}_{n}{suffix}"
+            if not candidate.exists():
+                dest = candidate
+                break
+            n += 1
+    shutil.copy2(latest, dest)
+    print(f"Replay copy: copied {latest} -> {dest}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -626,6 +670,7 @@ def main():
             with_screen_advice=True,
             final_pass=True,
         )
+        copy_session_replay_to_exp(start_ts, chunks_dir)
         stop_persistent_overlay(overlay_proc)
 
 
