@@ -20,6 +20,7 @@ ADVICE_PROMPT_TEMPLATE = """You are coaching a Dota 2 player.
 Use the attached screenshot plus the speech transcript context.
 Explain what is happening right now and the single next best action.
 Include item advice when appropriate.
+Follow the player's spoken instructions from the latest speech chunk, and incorporate them into your advice.
 Keep the response very short: at most 2 sentences.
 Think fast, latency is important.
 
