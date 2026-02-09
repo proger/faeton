@@ -15,7 +15,6 @@ PREFERRED_MIC_HINTS = ("steinberg ur22c", "ur22c")
 CHUNK_SECONDS = 30
 SCREEN_INPUT_PIXEL_FORMAT = "nv12"
 SAY_RATE_WPM = 350
-OVERLAY_DURATION_SECONDS = 20
 ADVICE_PROMPT_TEMPLATE = """You are coaching a Dota 2 player.
 Use the attached screenshot plus the speech transcript context.
 Explain what is happening right now and the single next best action.
@@ -27,59 +26,6 @@ Current chunk speech:
 
 All speech so far:
 {history_text}
-"""
-OVERLAY_SCRIPT = r"""
-import sys
-import tkinter as tk
-
-text = sys.argv[1]
-duration_ms = int(float(sys.argv[2]) * 1000)
-if not text.strip():
-    sys.exit(0)
-
-root = tk.Tk()
-root.withdraw()
-overlay = tk.Toplevel(root)
-overlay.overrideredirect(True)
-overlay.attributes("-topmost", True)
-overlay.attributes("-alpha", 0.78)
-overlay.configure(bg="black")
-try:
-    # macOS: make the overlay non-activating so it does not steal app focus.
-    overlay.tk.call("::tk::unsupported::MacWindowStyle", "style", overlay._w, "help", "noActivates")
-except tk.TclError:
-    pass
-
-screen_h = overlay.winfo_screenheight()
-screen_w = overlay.winfo_screenwidth()
-pad = 24
-window_w = 620
-
-label = tk.Label(
-    overlay,
-    text=text,
-    justify="left",
-    anchor="nw",
-    bg="black",
-    fg="white",
-    padx=18,
-    pady=14,
-    wraplength=window_w - 36,
-    font=("Menlo", 14),
-)
-label.pack(fill="both", expand=True)
-
-overlay.update_idletasks()
-needed_h = label.winfo_reqheight()
-max_h = max(200, screen_h - (pad * 2))
-window_h = min(needed_h, max_h)
-x = screen_w - window_w - pad
-y = pad
-overlay.geometry(f"{window_w}x{window_h}+{x}+{y}")
-
-if duration_ms > 0:
-    overlay.after(duration_ms, root.destroy)
-root.mainloop()
 """
 
 
@@ -265,19 +211,81 @@ def run_codex_advice(image_path, prompt, response_path):
     return True, response
 
 
-def show_overlay_text(text):
-    subprocess.Popen(
-        [sys.executable, "-c", OVERLAY_SCRIPT, text, str(OVERLAY_DURATION_SECONDS)],
+def get_overlay_binary_path():
+    repo_root = pathlib.Path(__file__).resolve().parent
+    cache_dir = repo_root / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "record_overlay_nonactivating"
+
+
+def build_overlay_binary():
+    swiftc = shutil.which("swiftc")
+    if swiftc is None:
+        print("swiftc not found; overlay disabled.", flush=True)
+        return None
+
+    source_path = pathlib.Path(__file__).resolve().parent / "overlay_nonactivating.swift"
+    if not source_path.exists():
+        print(f"Overlay source not found: {source_path}", flush=True)
+        return None
+
+    binary_path = get_overlay_binary_path()
+    if binary_path.exists() and binary_path.stat().st_mtime >= source_path.stat().st_mtime:
+        return binary_path
+
+    result = subprocess.run(
+        [swiftc, "-O", str(source_path), "-o", str(binary_path)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"Failed to build overlay binary: {result.stderr.strip()}", flush=True)
+        return None
+    return binary_path
+
+
+def start_persistent_overlay(chunks_dir):
+    overlay_binary = build_overlay_binary()
+    if overlay_binary is None:
+        return None, None
+
+    overlay_text_path = chunks_dir / "_overlay.txt"
+    overlay_text_path.write_text(
+        "Recording active.\nWaiting for chunk advice...",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [str(overlay_binary), "--text-file", str(overlay_text_path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    return proc, overlay_text_path
+
+
+def set_overlay_text(overlay_text_path, text):
+    if overlay_text_path is None:
+        return
+    overlay_text_path.write_text(text.strip() + "\n", encoding="utf-8")
+
+
+def stop_persistent_overlay(overlay_proc):
+    if overlay_proc is None or overlay_proc.poll() is not None:
+        return
+    overlay_proc.terminate()
+    try:
+        overlay_proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        overlay_proc.kill()
+        overlay_proc.wait()
 
 
 def speak_text(text):
     subprocess.run(["say", "-r", str(SAY_RATE_WPM), text], check=False)
 
 
-def generate_chunk_advice(chunks_dir, chunk_path, chunk_text):
+def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
     advice_path = chunk_path.with_name(f"{chunk_path.stem}_advice.txt")
     if advice_path.exists():
         return
@@ -314,7 +322,7 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text):
         encoding="utf-8",
     )
     print(f"[{chunk_path.stem}] advice: {response}", flush=True)
-    show_overlay_text(response)
+    set_overlay_text(overlay_text_path, response)
     speak_text(response)
 
 
@@ -327,6 +335,7 @@ def process_finished_chunks(
     n_frames,
     chunks_dir,
     processed,
+    overlay_text_path,
     with_screen_advice=False,
     final_pass=False,
 ):
@@ -345,7 +354,7 @@ def process_finished_chunks(
             model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, chunk
         )
         if with_screen_advice:
-            generate_chunk_advice(chunks_dir, chunk, chunk_text)
+            generate_chunk_advice(chunks_dir, chunk, chunk_text, overlay_text_path)
         processed.add(chunk)
 
 
@@ -448,6 +457,7 @@ def main():
 
     print(f"Chunk length: {CHUNK_SECONDS}s")
     print("Transcribing each completed chunk with Whisper Turbo (Torch API).")
+    overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir)
     screen_proc = None
     if args.screen:
         screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
@@ -538,6 +548,7 @@ def main():
                 n_frames,
                 chunks_dir,
                 processed_chunks,
+                overlay_text_path,
                 with_screen_advice=args.screen,
                 final_pass=False,
             )
@@ -562,9 +573,11 @@ def main():
             n_frames,
             chunks_dir,
             processed_chunks,
+            overlay_text_path,
             with_screen_advice=args.screen,
             final_pass=True,
         )
+        stop_persistent_overlay(overlay_proc)
 
 
 if __name__ == "__main__":
