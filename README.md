@@ -2,7 +2,7 @@
 
 faeton is a legendary dota coach.
 
-[![Demo](exp/demo_preview.jpg)](exp/demo.mp4)
+[![Demo](exp/demo_preview.png)](exp/demo.mp4)
 
 ## Install
 
