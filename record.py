@@ -12,12 +12,14 @@ import time
 SYSTEM_DEVICE_HINTS = ("blackhole", "loopback", "soundflower", "vb-cable")
 MIC_DEVICE_HINTS = ("microphone", "mic", "built-in")
 PREFERRED_MIC_HINTS = ("steinberg ur22c", "ur22c")
-CHUNK_SECONDS = 30
+CHUNK_SECONDS = 10
 SCREEN_INPUT_PIXEL_FORMAT = "nv12"
 SAY_RATE_WPM = 350
+WHISPER_CONTEXT_SECONDS = 30
 ADVICE_PROMPT_TEMPLATE = """You are coaching a Dota 2 player.
 Use the attached screenshot plus the speech transcript context.
 Explain what is happening right now and the single next best action.
+Include item advice when appropriate.
 Keep the response very short: at most 2 sentences.
 Think fast, latency is important.
 
@@ -104,7 +106,7 @@ def pick_device(devices, hints, exclude_hints=()):
 
 
 def transcribe_chunk(
-    model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, chunk_path
+    model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, chunks_dir, chunk_path
 ):
     txt_path = chunk_path.with_suffix(".txt")
     npy_path = chunk_path.with_name(f"{chunk_path.stem}_wenc.npy")
@@ -118,7 +120,21 @@ def transcribe_chunk(
         features = model.embed_audio(mel.unsqueeze(0))
     np.save(npy_path, features.squeeze(0).detach().cpu().numpy())
 
-    result = model.transcribe(str(chunk_path), fp16=use_fp16)
+    context_audio_path, temp_files = build_whisper_context_audio(chunks_dir, chunk_path)
+    initial_prompt = collect_prior_transcripts_for_chunk(chunks_dir, chunk_path)
+    try:
+        result = model.transcribe(
+            str(context_audio_path),
+            fp16=use_fp16,
+            language="en",
+            initial_prompt=initial_prompt or None,
+        )
+    finally:
+        for path in temp_files:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
     text = (result.get("text") or "").strip()
     txt_path.write_text(text + "\n", encoding="utf-8")
     print(f"[{chunk_path.stem}] {text}", flush=True)
@@ -135,6 +151,71 @@ def collect_speech_history(chunks_dir):
         if text:
             lines.append(f"{path.stem}: {text}")
     return "\n".join(lines) if lines else "(no speech yet)"
+
+
+def collect_prior_transcripts_for_chunk(chunks_dir, chunk_path):
+    try:
+        chunk_index = int(chunk_path.stem)
+    except ValueError:
+        return ""
+    lines = []
+    for i in range(chunk_index):
+        txt_path = chunks_dir / f"{i:06d}.txt"
+        if not txt_path.exists():
+            continue
+        text = txt_path.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def build_whisper_context_audio(chunks_dir, chunk_path):
+    window_chunks = max(1, (WHISPER_CONTEXT_SECONDS + CHUNK_SECONDS - 1) // CHUNK_SECONDS)
+    try:
+        chunk_index = int(chunk_path.stem)
+    except ValueError:
+        return chunk_path, []
+
+    start_index = max(0, chunk_index - window_chunks + 1)
+    context_paths = []
+    for i in range(start_index, chunk_index + 1):
+        p = chunks_dir / f"{i:06d}.opus"
+        if p.exists():
+            context_paths.append(p)
+    if not context_paths:
+        return chunk_path, []
+    if len(context_paths) == 1:
+        return context_paths[0], []
+
+    list_path = chunks_dir / f".{chunk_path.stem}_whisper_context.txt"
+    output_path = chunks_dir / f".{chunk_path.stem}_whisper_context.opus"
+    list_lines = []
+    for p in context_paths:
+        escaped = str(p.resolve()).replace("'", "'\\''")
+        list_lines.append(f"file '{escaped}'")
+    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            "-y",
+            str(output_path),
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+        return output_path, [list_path, output_path]
+    return chunk_path, [list_path]
 
 
 def wait_for_video_chunk(path, timeout_seconds=8):
@@ -186,6 +267,8 @@ def extract_last_frame(video_path, png_path):
 
 
 def run_codex_advice(image_path, prompt, response_path):
+    input_bytes = len(prompt.encode("utf-8")) + image_path.stat().st_size
+    started = time.time()
     result = subprocess.run(
         [
             "codex",
@@ -203,12 +286,13 @@ def run_codex_advice(image_path, prompt, response_path):
         stderr=subprocess.PIPE,
         text=True,
     )
+    elapsed = time.time() - started
     if result.returncode != 0:
-        return False, (result.stderr or "codex failed").strip()
+        return False, (result.stderr or "codex failed").strip(), elapsed, input_bytes
     response = response_path.read_text(encoding="utf-8", errors="replace").strip()
     if not response:
-        return False, "codex returned empty advice"
-    return True, response
+        return False, "codex returned empty advice", elapsed, input_bytes
+    return True, response, elapsed, input_bytes
 
 
 def get_overlay_binary_path():
@@ -308,21 +392,26 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     )
 
     response_path = chunk_path.with_name(f"{chunk_path.stem}_advice_response.txt")
-    ok, response_or_error = run_codex_advice(png_path, prompt, response_path)
+    ok, response_or_error, elapsed, input_bytes = run_codex_advice(
+        png_path, prompt, response_path
+    )
     if not ok:
         print(f"[{chunk_path.stem}] advice failed: {response_or_error}", flush=True)
         return
 
     response = response_or_error
+    input_kib = input_bytes / 1024.0
+    overlay_meta = f"step: input {input_kib:.1f}KiB, output {elapsed:.2f}s"
     advice_path.write_text(
         "Prompt:\n"
         f"{prompt.strip()}\n\n"
         "Response:\n"
-        f"{response.strip()}\n",
+        f"{response.strip()}\n\n"
+        f"{overlay_meta}\n",
         encoding="utf-8",
     )
     print(f"[{chunk_path.stem}] advice: {response}", flush=True)
-    set_overlay_text(overlay_text_path, response)
+    set_overlay_text(overlay_text_path, f"{response}\n{overlay_meta}")
     speak_text(response)
 
 
@@ -351,7 +440,14 @@ def process_finished_chunks(
         if chunk in processed:
             continue
         chunk_text = transcribe_chunk(
-            model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, chunk
+            model,
+            torch,
+            use_fp16,
+            log_mel_spectrogram,
+            pad_or_trim,
+            n_frames,
+            chunks_dir,
+            chunk,
         )
         if with_screen_advice:
             generate_chunk_advice(chunks_dir, chunk, chunk_text, overlay_text_path)
