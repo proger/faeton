@@ -308,7 +308,7 @@ def build_overlay_binary():
         print("swiftc not found; overlay disabled.", flush=True)
         return None
 
-    source_path = pathlib.Path(__file__).resolve().parent / "overlay_nonactivating.swift"
+    source_path = pathlib.Path(__file__).resolve().parent / "hud.swift"
     if not source_path.exists():
         print(f"Overlay source not found: {source_path}", flush=True)
         return None
@@ -374,15 +374,27 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     if advice_path.exists():
         return
 
-    down4_video_path = chunk_path.with_name(f"{chunk_path.stem}_down4_1fps.mp4")
-    if not wait_for_video_chunk(down4_video_path):
-        print(f"[{chunk_path.stem}] down4 video chunk missing, skipping advice", flush=True)
-        return
-
+    latest_live_png = chunks_dir / "latest_down4_1fps.png"
     png_path = chunk_path.with_name(f"{chunk_path.stem}_down4_1fps_last.png")
-    if not extract_last_frame(down4_video_path, png_path):
-        print(f"[{chunk_path.stem}] failed to extract last frame, skipping advice", flush=True)
-        return
+    if wait_for_video_chunk(latest_live_png, timeout_seconds=2):
+        shutil.copy2(latest_live_png, png_path)
+    else:
+        down4_video_path = chunk_path.with_name(f"{chunk_path.stem}_down4_1fps.mp4")
+        if not wait_for_video_chunk(down4_video_path):
+            candidates = sorted(
+                chunks_dir.glob("*_down4_1fps.mp4"),
+                key=lambda p: p.stem.split("_", 1)[0],
+            )
+            if candidates:
+                down4_video_path = candidates[-1]
+        if not wait_for_video_chunk(down4_video_path):
+            print(f"[{chunk_path.stem}] down4 video chunk missing, skipping advice", flush=True)
+            return
+        video_stem = down4_video_path.stem.replace("_down4_1fps", "")
+        png_path = chunk_path.with_name(f"{video_stem}_down4_1fps_last.png")
+        if not extract_last_frame(down4_video_path, png_path):
+            print(f"[{chunk_path.stem}] failed to extract last frame, skipping advice", flush=True)
+            return
 
     history_text = collect_speech_history(chunks_dir)
     safe_chunk_text = chunk_text.strip() if chunk_text and chunk_text.strip() else "(empty)"
@@ -436,9 +448,12 @@ def process_finished_chunks(
     elif not final_pass and len(chunks) == 1:
         return
 
+    chunk_texts = {}
+    latest_unprocessed_chunk = None
     for chunk in chunks:
         if chunk in processed:
             continue
+        latest_unprocessed_chunk = chunk
         chunk_text = transcribe_chunk(
             model,
             torch,
@@ -449,9 +464,15 @@ def process_finished_chunks(
             chunks_dir,
             chunk,
         )
-        if with_screen_advice:
-            generate_chunk_advice(chunks_dir, chunk, chunk_text, overlay_text_path)
+        chunk_texts[chunk] = chunk_text
         processed.add(chunk)
+    if with_screen_advice and latest_unprocessed_chunk is not None:
+        generate_chunk_advice(
+            chunks_dir,
+            latest_unprocessed_chunk,
+            chunk_texts.get(latest_unprocessed_chunk, ""),
+            overlay_text_path,
+        )
 
 
 def main():
@@ -558,6 +579,7 @@ def main():
     if args.screen:
         screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
         screen_segment_pattern_1fps = str(chunks_dir / "%06d_down4_1fps.mp4")
+        latest_frame_path = str(chunks_dir / "latest_down4_1fps.png")
         video_devices = list_avfoundation_video_devices()
         if not video_devices:
             raise SystemExit("No AVFoundation video devices found for screen recording.")
@@ -577,9 +599,10 @@ def main():
             f"{screen_id}:none",
             "-filter_complex",
             (
-                "[0:v]split=2[v30][v1];"
+                "[0:v]split=3[v30][v1][v1live];"
                 "[v30]fps=30,scale=trunc(iw/8):trunc(ih/8)[v30out];"
-                "[v1]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1out]"
+                "[v1]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1out];"
+                "[v1live]fps=1,scale=trunc(iw/4):trunc(ih/4)[v1liveout]"
             ),
             "-map",
             "[v30out]",
@@ -623,11 +646,20 @@ def main():
             "-reset_timestamps",
             "1",
             screen_segment_pattern_1fps,
+            "-map",
+            "[v1liveout]",
+            "-f",
+            "image2",
+            "-update",
+            "1",
+            "-q:v",
+            "2",
+            latest_frame_path,
         ]
         print(
             "Screen chunks "
             f"({screen_name}): {chunks_dir} "
-            "(*_down8_30fps.mp4, *_down4_1fps.mp4)"
+            "(*_down8_30fps.mp4, *_down4_1fps.mp4, latest_down4_1fps.png)"
         )
         screen_proc = subprocess.Popen(screen_command)
     print("Press Ctrl-C to stop.")
