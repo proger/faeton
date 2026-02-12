@@ -136,7 +136,9 @@ def transcribe_chunk(
 
 def collect_speech_history(chunks_dir):
     transcript_paths = sorted(
-        p for p in chunks_dir.glob("*.txt") if re.fullmatch(r"\d{6}\.txt", p.name)
+        p
+        for p in chunks_dir.glob("*.txt")
+        if re.fullmatch(r"(?:\d{6}|mic_\d{6}|loopback_\d{6})\.txt", p.name)
     )
     lines = []
     for path in transcript_paths:
@@ -197,6 +199,9 @@ def extract_last_frame(video_path, png_path):
 def run_codex_advice(image_path, prompt, response_path):
     input_bytes = len(prompt.encode("utf-8")) + image_path.stat().st_size
     started = time.time()
+    print("=== Codex prompt begin ===", flush=True)
+    print(prompt, flush=True)
+    print("=== Codex prompt end ===", flush=True)
     result = subprocess.run(
         [
             "codex",
@@ -371,10 +376,11 @@ def process_finished_chunks(
     chunks_dir,
     processed,
     overlay_text_path,
+    audio_glob,
     with_screen_advice=False,
     final_pass=False,
 ):
-    chunks = sorted(chunks_dir.glob("*.opus"))
+    chunks = sorted(chunks_dir.glob(audio_glob))
     if not chunks:
         return
     if not final_pass and len(chunks) > 1:
@@ -460,6 +466,11 @@ def main():
         default="",
         help="Optional suffix appended to the output directory name.",
     )
+    parser.add_argument(
+        "--whisper-loopback",
+        action="store_true",
+        help="Use loopback_%06d.opus files as Whisper input (default uses mic_%06d.opus).",
+    )
     args = parser.parse_args()
 
     if shutil.which("ffmpeg") is None:
@@ -492,18 +503,19 @@ def main():
     system_id, system_name = system_device
     mic_id, mic_name = mic_device
 
-    segment_output = (
-        f"[f=segment:segment_time={CHUNK_SECONDS}:reset_timestamps=1]"
-        f"{chunks_dir}/%06d.opus"
-    )
+    mic_segment_output = str(chunks_dir / "mic_%06d.opus")
+    loopback_segment_output = str(chunks_dir / "loopback_%06d.opus")
+    whisper_audio_glob = "loopback_*.opus" if args.whisper_loopback else "mic_*.opus"
 
     if system_id == mic_id:
-        command = [
+        audio_command = [
             "ffmpeg",
             "-f",
             "avfoundation",
             "-i",
             f":{system_id}",
+            "-map",
+            "0:a",
             "-ar",
             "48000",
             "-c:a",
@@ -511,12 +523,34 @@ def main():
             "-b:a",
             "160k",
             "-f",
-            "tee",
-            segment_output,
+            "segment",
+            "-segment_time",
+            str(CHUNK_SECONDS),
+            "-reset_timestamps",
+            "1",
+            mic_segment_output,
+            "-map",
+            "0:a",
+            "-ar",
+            "48000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "160k",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(CHUNK_SECONDS),
+            "-reset_timestamps",
+            "1",
+            loopback_segment_output,
         ]
-        print(f"Recording from aggregate device '{system_name}' to {chunks_dir}")
+        print(
+            f"Recording aggregate device '{system_name}' to {chunks_dir} "
+            "(duplicated into mic_*.opus and loopback_*.opus)"
+        )
     else:
-        command = [
+        audio_command = [
             "ffmpeg",
             "-f",
             "avfoundation",
@@ -526,10 +560,8 @@ def main():
             "avfoundation",
             "-i",
             f":{system_id}",
-            "-filter_complex",
-            "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[a]",
             "-map",
-            "[a]",
+            "0:a",
             "-ar",
             "48000",
             "-c:a",
@@ -537,14 +569,35 @@ def main():
             "-b:a",
             "160k",
             "-f",
-            "tee",
-            segment_output,
+            "segment",
+            "-segment_time",
+            str(CHUNK_SECONDS),
+            "-reset_timestamps",
+            "1",
+            mic_segment_output,
+            "-map",
+            "1:a",
+            "-ar",
+            "48000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "160k",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(CHUNK_SECONDS),
+            "-reset_timestamps",
+            "1",
+            loopback_segment_output,
         ]
         print(
-            f"Recording mic '{mic_name}' + system '{system_name}' to {chunks_dir}"
+            f"Recording mic '{mic_name}' -> mic_*.opus and "
+            f"system '{system_name}' -> loopback_*.opus in {chunks_dir}"
         )
 
     print(f"Chunk length: {CHUNK_SECONDS}s")
+    print(f"Whisper input source: {'loopback' if args.whisper_loopback else 'mic'}")
     print("Transcribing each completed chunk with Whisper Turbo (Torch API).")
     overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir)
     screen_proc = None
@@ -634,7 +687,7 @@ def main():
     )
     screen_proc = subprocess.Popen(screen_command)
     print("Press Ctrl-C to stop.")
-    proc = subprocess.Popen(command)
+    proc = subprocess.Popen(audio_command)
     processed_chunks = set()
     try:
         while proc.poll() is None:
@@ -648,6 +701,7 @@ def main():
                 chunks_dir,
                 processed_chunks,
                 overlay_text_path,
+                whisper_audio_glob,
                 with_screen_advice=True,
                 final_pass=False,
             )
@@ -673,6 +727,7 @@ def main():
             chunks_dir,
             processed_chunks,
             overlay_text_path,
+            whisper_audio_glob,
             with_screen_advice=True,
             final_pass=True,
         )
