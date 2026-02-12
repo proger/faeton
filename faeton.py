@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import numpy as np
 import pathlib
 import re
@@ -366,6 +367,17 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     speak_text(response)
 
 
+def run_reloaded_generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
+    module_name = pathlib.Path(__file__).resolve().stem
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib.import_module(module_name)
+    else:
+        module = importlib.reload(module)
+    reloaded_generate = getattr(module, "generate_chunk_advice")
+    reloaded_generate(chunks_dir, chunk_path, chunk_text, overlay_text_path)
+
+
 def process_finished_chunks(
     model,
     torch,
@@ -407,7 +419,7 @@ def process_finished_chunks(
         chunk_texts[chunk] = chunk_text
         processed.add(chunk)
     if with_screen_advice and latest_unprocessed_chunk is not None:
-        generate_chunk_advice(
+        run_reloaded_generate_chunk_advice(
             chunks_dir,
             latest_unprocessed_chunk,
             chunk_texts.get(latest_unprocessed_chunk, ""),
