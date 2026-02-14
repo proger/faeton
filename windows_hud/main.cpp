@@ -4,6 +4,7 @@
 #include <shellapi.h>
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -25,6 +26,9 @@ constexpr float kTopMargin = 30.0f;
 constexpr float kRightMargin = 30.0f;
 constexpr float kCornerRadius = 14.0f;
 constexpr BYTE kWindowOpacity = 217;  // ~85% of 255
+constexpr int kAppIconResId = 1;
+constexpr UINT kTrayCallbackMsg = WM_APP + 1;
+constexpr UINT kTrayExitCommand = 1001;
 
 struct AppState {
     std::wstring textFile;
@@ -41,6 +45,7 @@ struct AppState {
     std::wstring currentText = L"Recording active. Waiting for chunk advice...";
     std::wstring mainText = L"Recording active. Waiting for chunk advice...";
     std::wstring metaText;
+    HICON appIcon = nullptr;
 };
 
 void SafeRelease(IUnknown* p) {
@@ -239,10 +244,55 @@ bool ParseArgs(AppState& s) {
 
     if (argc >= 2) {
         s.textFile = argv[1];
+    } else {
+        wchar_t modulePath[MAX_PATH] = {};
+        DWORD len = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+        if (len > 0) {
+            std::filesystem::path p(modulePath);
+            p = p.parent_path() / L"overlay.txt";
+            if (std::filesystem::exists(p)) {
+                s.textFile = p.wstring();
+            }
+        }
     }
 
     LocalFree(argv);
     return !s.textFile.empty();
+}
+
+bool AddTrayIcon(HWND hwnd, HICON icon) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = kTrayCallbackMsg;
+    nid.hIcon = icon ? icon : LoadIconW(nullptr, IDI_APPLICATION);
+    lstrcpynW(nid.szTip, L"faeton", ARRAYSIZE(nid.szTip));
+    return Shell_NotifyIconW(NIM_ADD, &nid) == TRUE;
+}
+
+void RemoveTrayIcon(HWND hwnd) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+void ShowTrayMenu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
+    AppendMenuW(menu, MF_STRING, kTrayExitCommand, L"Exit");
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
 }
 
 void RefreshTextIfChanged(HWND hwnd, AppState& s) {
@@ -279,7 +329,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_CREATE: {
             SetTimer(hwnd, kPollTimerId, kPollMs, nullptr);
+            if (s) {
+                AddTrayIcon(hwnd, s->appIcon);
+            }
             return 0;
+        }
+        case kTrayCallbackMsg: {
+            if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+                ShowTrayMenu(hwnd);
+            } else if (lParam == WM_LBUTTONDBLCLK) {
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == kTrayExitCommand) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            return DefWindowProc(hwnd, msg, wParam, lParam);
         }
         case WM_TIMER: {
             if (s && wParam == kPollTimerId) {
@@ -342,6 +410,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_DESTROY: {
             KillTimer(hwnd, kPollTimerId);
+            RemoveTrayIcon(hwnd);
             PostQuitMessage(0);
             return 0;
         }
@@ -412,6 +481,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     wc.hInstance = hInstance;
     wc.lpszClassName = L"FaetonHudWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    state.appIcon = static_cast<HICON>(LoadImageW(
+        hInstance, MAKEINTRESOURCEW(kAppIconResId), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    wc.hIcon = state.appIcon ? state.appIcon : LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIconSm = state.appIcon ? state.appIcon : LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
@@ -460,6 +533,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     SafeRelease(state.mainFormat);
     SafeRelease(state.dwriteFactory);
     SafeRelease(state.d2dFactory);
+    if (state.appIcon) {
+        DestroyIcon(state.appIcon);
+        state.appIcon = nullptr;
+    }
 
     return static_cast<int>(msg.wParam);
 }
