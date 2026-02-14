@@ -3,6 +3,7 @@ import argparse
 import importlib
 import numpy as np
 import pathlib
+import random
 import re
 import signal
 import shutil
@@ -24,6 +25,7 @@ Explain what is happening right now and the single next best action.
 Include item advice when appropriate.
 Identify two heroes visible on screen and discuss their most likely interaction in this moment.
 Follow the player's spoken instructions from the latest speech chunk, and incorporate them into your advice.
+Prioritize answering the player's most recent spoken question first.
 Advice takes at least 15 seconds to return, so complete real-time commentary is not necessary.
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
 Avoid repeating previous advice unless there is a strong new reason to repeat it.
@@ -31,6 +33,11 @@ Vary your situation modeling and phrasing across chunks; avoid repeating the sam
 Incorporate feedback from prior advice: '+' means useful direction, '-' means unhelpful direction.
 Keep the response very short: exactly 1 sentence.
 Think fast, latency is important.
+Output format is mandatory:
+ADVICE: <exactly 1 sentence actionable coaching response>
+NEW GAME STATE: <only new game-state facts not already in Known game state; concise semicolon-separated facts, or 'none'>
+When adding NEW GAME STATE, assume it will be appended after existing Known game state; do not repeat old facts.
+In NEW GAME STATE, always include the current in-game time (or best visible time estimate) in each new fact when available.
 
 Current chunk speech:
 {chunk_text}
@@ -40,6 +47,9 @@ All speech so far:
 
 Recent advice feedback:
 {feedback_text}
+
+Known game state:
+{known_game_state}
 """
 
 
@@ -49,6 +59,10 @@ class LiveRecognizerState:
     next_advice_idx: int = 0
     pending_question_text: str = ""
     chunk_prefix: str = "mic"
+    next_random_trigger_ts: float = 0.0
+
+
+KNOWN_GAME_STATE_PATH = "_known_game_state.txt"
 
 
 def load_whisper_model():
@@ -222,6 +236,9 @@ def process_live_audio_file(
     state: LiveRecognizerState,
     with_screen_advice=False,
 ):
+    if state.next_random_trigger_ts <= 0:
+        state.next_random_trigger_ts = time.time() + 5.0
+
     full_text, seen_seconds = transcribe_live_wav_window(
         model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, live_wav_path
     )
@@ -230,6 +247,7 @@ def process_live_audio_file(
 
     delta_text = stitch_new_text(state.emitted_words, full_text)
     if delta_text:
+        interrupt_speech_playback(chunks_dir)
         stream_path = chunks_dir / "_live_stream.txt"
         with stream_path.open("a", encoding="utf-8") as f:
             f.write(delta_text + "\n")
@@ -260,6 +278,26 @@ def process_live_audio_file(
                 )
             state.next_advice_idx += 1
 
+    # Fallback: if no explicit question is asked, trigger advice randomly
+    # with probability 1/4 every 5 seconds using buffered speech context.
+    now = time.time()
+    if now >= state.next_random_trigger_ts:
+        state.next_random_trigger_ts = now + 5.0
+        buffered = state.pending_question_text.strip()
+        if buffered and random.random() < 0.25:
+            advice_idx = state.next_advice_idx
+            chunk_stem = f"{state.chunk_prefix}_{advice_idx:06d}"
+            chunk_path = chunks_dir / f"{chunk_stem}.wav"
+            txt_path = chunks_dir / f"{chunk_stem}.txt"
+            txt_path.write_text(buffered + "\n", encoding="utf-8")
+            print(f"[{chunk_stem}] {buffered}", flush=True)
+            if with_screen_advice:
+                run_reloaded_generate_chunk_advice(
+                    chunks_dir, chunk_path, buffered, overlay_text_path
+                )
+            state.pending_question_text = ""
+            state.next_advice_idx += 1
+
 def collect_speech_history(chunks_dir):
     transcript_paths = sorted(
         p
@@ -287,6 +325,47 @@ def collect_feedback_history(chunks_dir, limit=12):
     if not lines:
         return "(no feedback yet)"
     return "\n".join(lines[-limit:])
+
+
+def load_known_game_state(chunks_dir):
+    path = chunks_dir / KNOWN_GAME_STATE_PATH
+    if not path.exists():
+        return "(none yet)"
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    return text if text else "(none yet)"
+
+
+def update_known_game_state(chunks_dir, new_state_text):
+    cleaned = (new_state_text or "").strip()
+    if not cleaned or cleaned.lower() == "none":
+        return
+    path = chunks_dir / KNOWN_GAME_STATE_PATH
+    existing = []
+    if path.exists():
+        existing = [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    seen = {ln.lower(): True for ln in existing}
+    additions = []
+    for part in re.split(r"[;\n]+", cleaned):
+        item = part.strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen[key] = True
+        additions.append(item)
+    if additions:
+        # Keep prior state in-place and append newly discovered facts last.
+        merged = existing + additions
+        path.write_text("\n".join(merged) + "\n", encoding="utf-8")
+
+
+def extract_section(text, label):
+    pattern = rf"(?ims)^\s*{re.escape(label)}\s*:\s*(.*?)(?=^\s*[A-Z][A-Z _-]*\s*:|\Z)"
+    m = re.search(pattern, text or "")
+    if not m:
+        return ""
+    return m.group(1).strip()
 
 
 def wait_for_video_chunk(path, timeout_seconds=8):
@@ -475,6 +554,12 @@ def speak_text_for_session(text, chunks_dir):
         time.sleep(0.05)
 
 
+def interrupt_speech_playback(chunks_dir):
+    if chunks_dir is None:
+        return
+    (chunks_dir / "_stop_playback.flag").write_text("1\n", encoding="utf-8")
+
+
 def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
     advice_path = chunk_path.with_name(f"{chunk_path.stem}_advice.txt")
     if advice_path.exists():
@@ -504,11 +589,13 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
 
     history_text = collect_speech_history(chunks_dir)
     feedback_text = collect_feedback_history(chunks_dir)
+    known_game_state = load_known_game_state(chunks_dir)
     safe_chunk_text = chunk_text.strip() if chunk_text and chunk_text.strip() else "(empty)"
     prompt = ADVICE_PROMPT_TEMPLATE.format(
         chunk_text=safe_chunk_text,
         history_text=history_text,
         feedback_text=feedback_text,
+        known_game_state=known_game_state,
     )
     input_bytes = len(prompt.encode("utf-8")) + png_path.stat().st_size
     input_kib = input_bytes / 1024.0
@@ -526,10 +613,15 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
         return
 
     response = response_or_error
+    advice_text = extract_section(response, "ADVICE")
+    if not advice_text:
+        advice_text = response.strip()
+    new_game_state = extract_section(response, "NEW GAME STATE")
+    update_known_game_state(chunks_dir, new_game_state)
     print("==== Codex advice begin ====", flush=True)
     print(response, flush=True)
     print("==== Codex advice end ====", flush=True)
-    print(f"[{chunk_path.stem}] advice: {response}", flush=True)
+    print(f"[{chunk_path.stem}] advice: {advice_text}", flush=True)
     input_kib = input_bytes / 1024.0
     overlay_meta = f"step: input {input_kib:.1f}KiB, output {elapsed:.2f}s"
     advice_path.write_text(
@@ -537,14 +629,18 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
         f"{prompt.strip()}\n\n"
         "Response:\n"
         f"{response.strip()}\n\n"
+        "Parsed advice:\n"
+        f"{advice_text}\n\n"
+        "Parsed new game state:\n"
+        f"{new_game_state or 'none'}\n\n"
         f"{overlay_meta}\n",
         encoding="utf-8",
     )
     (chunks_dir / "_current_advice_chunk.txt").write_text(
         f"{chunk_path.stem}\n", encoding="utf-8"
     )
-    set_overlay_text(overlay_text_path, f"{response}\n{overlay_meta}")
-    speak_text_for_session(response, chunks_dir)
+    set_overlay_text(overlay_text_path, advice_text)
+    speak_text_for_session(advice_text, chunks_dir)
 
 
 def run_reloaded_generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
