@@ -132,32 +132,6 @@ def pick_device(devices, hints, exclude_hints=()):
     return None
 
 
-def transcribe_chunk(
-    model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, chunks_dir, chunk_path
-):
-    txt_path = chunk_path.with_suffix(".txt")
-    npy_path = chunk_path.with_name(f"{chunk_path.stem}_wenc.npy")
-    if txt_path.exists() and npy_path.exists():
-        return txt_path.read_text(encoding="utf-8", errors="replace").strip()
-    mel = log_mel_spectrogram(str(chunk_path), model.dims.n_mels)
-    mel = pad_or_trim(mel, n_frames).to(model.device)
-    if use_fp16:
-        mel = mel.half()
-    with torch.no_grad():
-        features = model.embed_audio(mel.unsqueeze(0))
-    np.save(npy_path, features.squeeze(0).detach().cpu().numpy())
-
-    result = model.transcribe(
-        str(chunk_path),
-        fp16=use_fp16,
-        language="en",
-    )
-    text = (result.get("text") or "").strip()
-    txt_path.write_text(text + "\n", encoding="utf-8")
-    print(f"[{chunk_path.stem}] {text}", flush=True)
-    return text
-
-
 def _normalize_word(word):
     return re.sub(r"[^\w']+", "", word.lower())
 
@@ -509,10 +483,6 @@ def stop_persistent_overlay(overlay_proc):
         overlay_proc.wait()
 
 
-def speak_text(text):
-    speak_text_for_session(text, None)
-
-
 def speak_text_for_session(text, chunks_dir):
     stop_flag = None
     if chunks_dir is not None:
@@ -633,55 +603,6 @@ def run_reloaded_generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overl
     reloaded_generate(chunks_dir, chunk_path, chunk_text, overlay_text_path)
 
 
-def process_finished_chunks(
-    model,
-    torch,
-    use_fp16,
-    log_mel_spectrogram,
-    pad_or_trim,
-    n_frames,
-    chunks_dir,
-    processed,
-    overlay_text_path,
-    audio_glob,
-    with_screen_advice=False,
-    final_pass=False,
-):
-    chunks = sorted(chunks_dir.glob(audio_glob))
-    if not chunks:
-        return
-    if not final_pass and len(chunks) > 1:
-        chunks = chunks[:-1]
-    elif not final_pass and len(chunks) == 1:
-        return
-
-    chunk_texts = {}
-    latest_unprocessed_chunk = None
-    for chunk in chunks:
-        if chunk in processed:
-            continue
-        latest_unprocessed_chunk = chunk
-        chunk_text = transcribe_chunk(
-            model,
-            torch,
-            use_fp16,
-            log_mel_spectrogram,
-            pad_or_trim,
-            n_frames,
-            chunks_dir,
-            chunk,
-        )
-        chunk_texts[chunk] = chunk_text
-        processed.add(chunk)
-    if with_screen_advice and latest_unprocessed_chunk is not None:
-        run_reloaded_generate_chunk_advice(
-            chunks_dir,
-            latest_unprocessed_chunk,
-            chunk_texts.get(latest_unprocessed_chunk, ""),
-            overlay_text_path,
-        )
-
-
 def copy_session_replay_to_exp(session_start_unix, chunks_dir):
     replay_dir = DOTA_REPLAY_DIR
     if not replay_dir.is_dir():
@@ -775,8 +696,6 @@ def main():
     mic_live_wav = str(chunks_dir / "mic_live.wav")
     loopback_live_wav = str(chunks_dir / "loopback_live.wav")
     whisper_live_wav = pathlib.Path(loopback_live_wav if args.whisper_loopback else mic_live_wav)
-    whisper_audio_glob = "loopback_*.opus" if args.whisper_loopback else "mic_*.opus"
-
     if system_id == mic_id:
         audio_command = [
             "ffmpeg",
