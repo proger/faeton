@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 
 SYSTEM_DEVICE_HINTS = ("blackhole", "loopback", "soundflower", "vb-cable")
 MIC_DEVICE_HINTS = ("microphone", "mic", "built-in")
@@ -27,6 +28,7 @@ Advice takes at least 15 seconds to return, so complete real-time commentary is 
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
 Avoid repeating previous advice unless there is a strong new reason to repeat it.
 Vary your situation modeling and phrasing across chunks; avoid repeating the same framing too often.
+Incorporate feedback from prior advice: '+' means useful direction, '-' means unhelpful direction.
 Keep the response very short: exactly 1 sentence.
 Think fast, latency is important.
 
@@ -35,7 +37,18 @@ Current chunk speech:
 
 All speech so far:
 {history_text}
+
+Recent advice feedback:
+{feedback_text}
 """
+
+
+@dataclass
+class LiveRecognizerState:
+    emitted_words: list[str] = field(default_factory=list)
+    next_advice_idx: int = 0
+    pending_question_text: str = ""
+    chunk_prefix: str = "mic"
 
 
 def load_whisper_model():
@@ -135,6 +148,118 @@ def transcribe_chunk(
     return text
 
 
+def _normalize_word(word):
+    return re.sub(r"[^\w']+", "", word.lower())
+
+
+def _split_words(text):
+    return re.findall(r"\S+", text or "")
+
+
+def stitch_new_text(emitted_words, current_text, lookback_words=120):
+    curr_words = _split_words(current_text)
+    if not curr_words:
+        return ""
+    if not emitted_words:
+        emitted_words.extend(curr_words)
+        return " ".join(curr_words)
+
+    a = emitted_words[-lookback_words:]
+    b = curr_words
+    max_k = min(len(a), len(b))
+    overlap = 0
+    for k in range(max_k, 0, -1):
+        ok = True
+        for i in range(k):
+            if _normalize_word(a[len(a) - k + i]) != _normalize_word(b[i]):
+                ok = False
+                break
+        if ok:
+            overlap = k
+            break
+    new_words = b[overlap:]
+    if not new_words:
+        return ""
+    emitted_words.extend(new_words)
+    return " ".join(new_words)
+
+
+def transcribe_live_wav_window(model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, wav_path):
+    if not wav_path.exists() or wav_path.stat().st_size <= 44:
+        return "", 0.0
+    try:
+        import whisper
+        audio = whisper.load_audio(str(wav_path))
+    except Exception:
+        return "", 0.0
+    if audio.size == 0:
+        return "", 0.0
+
+    sample_rate = 16000
+    window_samples = CHUNK_SECONDS * sample_rate
+    if audio.shape[0] > window_samples:
+        audio = audio[-window_samples:]
+
+    mel = log_mel_spectrogram(audio, model.dims.n_mels)
+    mel = pad_or_trim(mel, n_frames).to(model.device)
+    if use_fp16:
+        mel = mel.half()
+    result = model.decode(mel, whisper.DecodingOptions(language="en", task="transcribe", fp16=use_fp16))
+    text = (result.text or "").strip()
+    return text, float(audio.shape[0]) / sample_rate
+
+
+def process_live_audio_file(
+    model,
+    torch,
+    use_fp16,
+    log_mel_spectrogram,
+    pad_or_trim,
+    n_frames,
+    chunks_dir,
+    overlay_text_path,
+    live_wav_path,
+    state: LiveRecognizerState,
+    with_screen_advice=False,
+):
+    full_text, seen_seconds = transcribe_live_wav_window(
+        model, torch, use_fp16, log_mel_spectrogram, pad_or_trim, n_frames, live_wav_path
+    )
+    if not full_text:
+        return
+
+    delta_text = stitch_new_text(state.emitted_words, full_text)
+    if delta_text:
+        stream_path = chunks_dir / "_live_stream.txt"
+        with stream_path.open("a", encoding="utf-8") as f:
+            f.write(delta_text + "\n")
+        print(f"[live +{int(seen_seconds)}s] {delta_text}", flush=True)
+        pending = state.pending_question_text.strip()
+        if pending:
+            pending = f"{pending} {delta_text.strip()}"
+        else:
+            pending = delta_text.strip()
+        state.pending_question_text = pending
+
+        # Trigger advice only when Whisper output contains complete question(s).
+        while "?" in state.pending_question_text:
+            before, after = state.pending_question_text.split("?", 1)
+            question_text = (before.strip() + "?").strip()
+            state.pending_question_text = after.strip()
+            if not question_text:
+                continue
+            advice_idx = state.next_advice_idx
+            chunk_stem = f"{state.chunk_prefix}_{advice_idx:06d}"
+            chunk_path = chunks_dir / f"{chunk_stem}.wav"
+            txt_path = chunks_dir / f"{chunk_stem}.txt"
+            txt_path.write_text(question_text + "\n", encoding="utf-8")
+            print(f"[{chunk_stem}] {question_text}", flush=True)
+            if with_screen_advice:
+                run_reloaded_generate_chunk_advice(
+                    chunks_dir, chunk_path, question_text, overlay_text_path
+                )
+            state.next_advice_idx += 1
+
 def collect_speech_history(chunks_dir):
     transcript_paths = sorted(
         p
@@ -147,6 +272,21 @@ def collect_speech_history(chunks_dir):
         if text:
             lines.append(f"{path.stem}: {text}")
     return "\n".join(lines) if lines else "(no speech yet)"
+
+
+def collect_feedback_history(chunks_dir, limit=12):
+    feedback_paths = sorted(chunks_dir.glob("*_advice_feedback.txt"))
+    lines = []
+    for path in feedback_paths:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not raw:
+            continue
+        latest = raw.splitlines()[-1].strip()
+        advice_id = path.stem.replace("_advice_feedback", "")
+        lines.append(f"{advice_id}: {latest}")
+    if not lines:
+        return "(no feedback yet)"
+    return "\n".join(lines[-limit:])
 
 
 def wait_for_video_chunk(path, timeout_seconds=8):
@@ -207,6 +347,10 @@ def run_codex_advice(image_path, prompt, response_path):
         [
             "codex",
             "exec",
+            "-m",
+            "gpt-5.3-codex",
+            "-c",
+            "model_reasoning_effort=low",
             "--skip-git-repo-check",
             "-i",
             str(image_path),
@@ -275,7 +419,13 @@ def start_persistent_overlay(chunks_dir):
         encoding="utf-8",
     )
     proc = subprocess.Popen(
-        [str(overlay_binary), "--text-file", str(overlay_text_path)],
+        [
+            str(overlay_binary),
+            "--text-file",
+            str(overlay_text_path),
+            "--session-dir",
+            str(chunks_dir),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -300,7 +450,29 @@ def stop_persistent_overlay(overlay_proc):
 
 
 def speak_text(text):
-    subprocess.run(["say", "-r", str(SAY_RATE_WPM), text], check=False)
+    speak_text_for_session(text, None)
+
+
+def speak_text_for_session(text, chunks_dir):
+    stop_flag = None
+    if chunks_dir is not None:
+        stop_flag = chunks_dir / "_stop_playback.flag"
+        if stop_flag.exists():
+            stop_flag.unlink(missing_ok=True)
+    proc = subprocess.Popen(["say", "-r", str(SAY_RATE_WPM), text])
+    while True:
+        if proc.poll() is not None:
+            break
+        if stop_flag is not None and stop_flag.exists():
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stop_flag.unlink(missing_ok=True)
+            break
+        time.sleep(0.05)
 
 
 def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
@@ -331,10 +503,12 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
             return
 
     history_text = collect_speech_history(chunks_dir)
+    feedback_text = collect_feedback_history(chunks_dir)
     safe_chunk_text = chunk_text.strip() if chunk_text and chunk_text.strip() else "(empty)"
     prompt = ADVICE_PROMPT_TEMPLATE.format(
         chunk_text=safe_chunk_text,
         history_text=history_text,
+        feedback_text=feedback_text,
     )
     input_bytes = len(prompt.encode("utf-8")) + png_path.stat().st_size
     input_kib = input_bytes / 1024.0
@@ -352,6 +526,10 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
         return
 
     response = response_or_error
+    print("==== Codex advice begin ====", flush=True)
+    print(response, flush=True)
+    print("==== Codex advice end ====", flush=True)
+    print(f"[{chunk_path.stem}] advice: {response}", flush=True)
     input_kib = input_bytes / 1024.0
     overlay_meta = f"step: input {input_kib:.1f}KiB, output {elapsed:.2f}s"
     advice_path.write_text(
@@ -362,9 +540,11 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
         f"{overlay_meta}\n",
         encoding="utf-8",
     )
-    print(f"[{chunk_path.stem}] advice: {response}", flush=True)
+    (chunks_dir / "_current_advice_chunk.txt").write_text(
+        f"{chunk_path.stem}\n", encoding="utf-8"
+    )
     set_overlay_text(overlay_text_path, f"{response}\n{overlay_meta}")
-    speak_text(response)
+    speak_text_for_session(response, chunks_dir)
 
 
 def run_reloaded_generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path):
@@ -517,6 +697,9 @@ def main():
 
     mic_segment_output = str(chunks_dir / "mic_%06d.opus")
     loopback_segment_output = str(chunks_dir / "loopback_%06d.opus")
+    mic_live_wav = str(chunks_dir / "mic_live.wav")
+    loopback_live_wav = str(chunks_dir / "loopback_live.wav")
+    whisper_live_wav = pathlib.Path(loopback_live_wav if args.whisper_loopback else mic_live_wav)
     whisper_audio_glob = "loopback_*.opus" if args.whisper_loopback else "mic_*.opus"
 
     if system_id == mic_id:
@@ -556,6 +739,28 @@ def main():
             "-reset_timestamps",
             "1",
             loopback_segment_output,
+            "-map",
+            "0:a",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            mic_live_wav,
+            "-map",
+            "0:a",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            loopback_live_wav,
         ]
         print(
             f"Recording aggregate device '{system_name}' to {chunks_dir} "
@@ -602,6 +807,28 @@ def main():
             "-reset_timestamps",
             "1",
             loopback_segment_output,
+            "-map",
+            "0:a",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            mic_live_wav,
+            "-map",
+            "1:a",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            loopback_live_wav,
         ]
         print(
             f"Recording mic '{mic_name}' -> mic_*.opus and "
@@ -610,7 +837,8 @@ def main():
 
     print(f"Chunk length: {CHUNK_SECONDS}s")
     print(f"Whisper input source: {'loopback' if args.whisper_loopback else 'mic'}")
-    print("Transcribing each completed chunk with Whisper Turbo (Torch API).")
+    print(f"Live WAV input: {whisper_live_wav}")
+    print("Transcribing live WAV input with Whisper Turbo (Torch API).")
     overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir)
     screen_proc = None
     screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
@@ -700,10 +928,12 @@ def main():
     screen_proc = subprocess.Popen(screen_command)
     print("Press Ctrl-C to stop.")
     proc = subprocess.Popen(audio_command)
-    processed_chunks = set()
+    live_state = LiveRecognizerState(
+        chunk_prefix="loopback" if args.whisper_loopback else "mic",
+    )
     try:
         while proc.poll() is None:
-            process_finished_chunks(
+            process_live_audio_file(
                 model,
                 torch,
                 use_fp16,
@@ -711,11 +941,10 @@ def main():
                 pad_or_trim,
                 n_frames,
                 chunks_dir,
-                processed_chunks,
                 overlay_text_path,
-                whisper_audio_glob,
+                whisper_live_wav,
+                live_state,
                 with_screen_advice=True,
-                final_pass=False,
             )
             time.sleep(1)
     except KeyboardInterrupt:
@@ -729,7 +958,7 @@ def main():
         if screen_proc is not None and screen_proc.poll() is None:
             screen_proc.send_signal(signal.SIGINT)
             screen_proc.wait()
-        process_finished_chunks(
+        process_live_audio_file(
             model,
             torch,
             use_fp16,
@@ -737,11 +966,10 @@ def main():
             pad_or_trim,
             n_frames,
             chunks_dir,
-            processed_chunks,
             overlay_text_path,
-            whisper_audio_glob,
+            whisper_live_wav,
+            live_state,
             with_screen_advice=True,
-            final_pass=True,
         )
         copy_session_replay_to_exp(start_ts, chunks_dir)
         stop_persistent_overlay(overlay_proc)
