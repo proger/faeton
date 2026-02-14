@@ -30,7 +30,6 @@ Advice takes at least 15 seconds to return, so complete real-time commentary is 
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
 Avoid repeating previous advice unless there is a strong new reason to repeat it.
 Vary your situation modeling and phrasing across chunks; avoid repeating the same framing too often.
-Incorporate feedback from prior advice: '+' means useful direction, '-' means unhelpful direction.
 Keep the response very short: exactly 1 sentence.
 Think fast, latency is important.
 Output format is mandatory:
@@ -44,9 +43,6 @@ Current chunk speech:
 
 All speech so far:
 {history_text}
-
-Recent advice feedback:
-{feedback_text}
 
 Known game state:
 {known_game_state}
@@ -312,21 +308,6 @@ def collect_speech_history(chunks_dir):
     return "\n".join(lines) if lines else "(no speech yet)"
 
 
-def collect_feedback_history(chunks_dir, limit=12):
-    feedback_paths = sorted(chunks_dir.glob("*_advice_feedback.txt"))
-    lines = []
-    for path in feedback_paths:
-        raw = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not raw:
-            continue
-        latest = raw.splitlines()[-1].strip()
-        advice_id = path.stem.replace("_advice_feedback", "")
-        lines.append(f"{advice_id}: {latest}")
-    if not lines:
-        return "(no feedback yet)"
-    return "\n".join(lines[-limit:])
-
-
 def load_known_game_state(chunks_dir):
     path = chunks_dir / KNOWN_GAME_STATE_PATH
     if not path.exists():
@@ -588,13 +569,11 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
             return
 
     history_text = collect_speech_history(chunks_dir)
-    feedback_text = collect_feedback_history(chunks_dir)
     known_game_state = load_known_game_state(chunks_dir)
     safe_chunk_text = chunk_text.strip() if chunk_text and chunk_text.strip() else "(empty)"
     prompt = ADVICE_PROMPT_TEMPLATE.format(
         chunk_text=safe_chunk_text,
         history_text=history_text,
-        feedback_text=feedback_text,
         known_game_state=known_game_state,
     )
     input_bytes = len(prompt.encode("utf-8")) + png_path.stat().st_size
