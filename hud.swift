@@ -12,8 +12,6 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     )
     private let textField = NSTextField(wrappingLabelWithString: "")
     private let metaField = NSTextField(wrappingLabelWithString: "")
-    private let plusButton = NSButton(title: "+", target: nil, action: nil)
-    private let minusButton = NSButton(title: "-", target: nil, action: nil)
     private var timer: Timer?
     private var eventMonitor: Any?
     private var lastText = ""
@@ -72,26 +70,12 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         metaField.isEditable = false
         metaField.isSelectable = false
 
-        plusButton.bezelStyle = .rounded
-        plusButton.controlSize = .small
-        plusButton.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
-        plusButton.target = self
-        plusButton.action = #selector(votePlus)
-
-        minusButton.bezelStyle = .rounded
-        minusButton.controlSize = .small
-        minusButton.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
-        minusButton.target = self
-        minusButton.action = #selector(voteMinus)
-
         let container = NSView(frame: panel.contentView!.bounds)
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = container
         container.addSubview(textField)
         container.addSubview(metaField)
-        container.addSubview(plusButton)
-        container.addSubview(minusButton)
     }
 
     private func refreshTextIfNeeded() {
@@ -112,10 +96,6 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         let innerPadY: CGFloat = 14
         let innerGap: CGFloat = 8
         let metaBottom: CGFloat = 10
-        let buttonBottom: CGFloat = 8
-        let buttonWidth: CGFloat = 30
-        let buttonHeight: CGFloat = 24
-        let buttonGap: CGFloat = 6
         let width: CGFloat = 620
         let maxHeight = max(220, NSScreen.main?.frame.height ?? 900 - (pad * 2))
 
@@ -124,7 +104,11 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         let mainText: String
         if let last = lines.last,
            (last.lowercased().hasPrefix("meta:") || last.lowercased().hasPrefix("step:")) {
-            metaLine = last
+            if last.lowercased().hasPrefix("meta:") {
+                metaLine = String(last.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            } else {
+                metaLine = last
+            }
             mainText = lines.dropLast().joined(separator: "\n")
         } else {
             metaLine = ""
@@ -134,14 +118,6 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         textField.stringValue = mainText
         metaField.stringValue = metaLine
         let trimmedMain = mainText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowerMain = trimmedMain.lowercased()
-        let showFeedbackButtons =
-            !trimmedMain.isEmpty &&
-            !lowerMain.hasPrefix("recording active.") &&
-            !lowerMain.hasPrefix("waiting for chunk advice") &&
-            !lowerMain.hasPrefix("thinking...")
-        plusButton.isHidden = !showFeedbackButtons
-        minusButton.isHidden = !showFeedbackButtons
         textField.preferredMaxLayoutWidth = width - (innerPadX * 2)
         metaField.preferredMaxLayoutWidth = width - (innerPadX * 2)
         let mainFit = textField.fittingSize
@@ -168,31 +144,6 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
             width: width - (innerPadX * 2),
             height: metaHeight
         )
-        if showFeedbackButtons {
-            let buttonY = buttonBottom
-            plusButton.frame = NSRect(
-                x: width - innerPadX - buttonWidth,
-                y: buttonY,
-                width: buttonWidth,
-                height: buttonHeight
-            )
-            minusButton.frame = NSRect(
-                x: width - innerPadX - (buttonWidth * 2) - buttonGap,
-                y: buttonY,
-                width: buttonWidth,
-                height: buttonHeight
-            )
-        }
-    }
-
-    @objc private func votePlus() {
-        requestStopPlayback()
-        writeFeedback("+")
-    }
-
-    @objc private func voteMinus() {
-        requestStopPlayback()
-        writeFeedback("-")
     }
 
     private func requestStopPlayback() {
@@ -200,27 +151,6 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         try? "stop\n".write(to: stopPath, atomically: true, encoding: .utf8)
     }
 
-    private func writeFeedback(_ vote: String) {
-        let currentPath = sessionDirURL.appendingPathComponent("_current_advice_chunk.txt")
-        guard let currentRaw = try? String(contentsOf: currentPath, encoding: .utf8) else {
-            NSSound.beep()
-            return
-        }
-        let adviceStem = currentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !adviceStem.isEmpty else {
-            NSSound.beep()
-            return
-        }
-        let feedbackPath = sessionDirURL.appendingPathComponent("\(adviceStem)_advice_feedback.txt")
-        let existing = (try? String(contentsOf: feedbackPath, encoding: .utf8)) ?? ""
-        let line = "\(Int(Date().timeIntervalSince1970))\t\(vote)\n"
-        let updated = existing + line
-        do {
-            try updated.write(to: feedbackPath, atomically: true, encoding: .utf8)
-        } catch {
-            NSSound.beep()
-        }
-    }
 }
 
 private func parseArgs() -> (URL, URL)? {

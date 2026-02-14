@@ -26,11 +26,16 @@ Include item advice when appropriate.
 Identify two heroes visible on screen and discuss their most likely interaction in this moment.
 Follow the player's spoken instructions from the latest speech chunk, and incorporate them into your advice.
 Prioritize answering the player's most recent spoken question first.
+If there is no direct question in the current chunk, give a brief game-situation read plus directional next-step advice.
 Advice takes at least 15 seconds to return, so complete real-time commentary is not necessary.
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
 Avoid repeating previous advice unless there is a strong new reason to repeat it.
+Do not repeat your previous response unless game state changed meaningfully.
+Treat short filler follow-ups (e.g., "thank you", "let's go", "nice", "ok") as likely speech-recognition false positives unless clearly tied to a real gameplay question.
 Vary your situation modeling and phrasing across chunks; avoid repeating the same framing too often.
 Keep the response very short: exactly 1 sentence.
+Be extremely concise: cap ADVICE to about 8-14 words.
+Use light Gen Z phrasing naturally (e.g., "nah", "lowkey", "hard commit"), but keep it clear and actionable.
 Think fast, latency is important.
 Output format is mandatory:
 ADVICE: <exactly 1 sentence actionable coaching response>
@@ -442,14 +447,43 @@ def build_overlay_binary():
     return binary_path
 
 
-def start_persistent_overlay(chunks_dir):
+def get_image_resolution(image_path):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                str(image_path),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        value = (result.stdout or "").strip()
+        return value if value else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def start_persistent_overlay(chunks_dir, current_microphone):
     overlay_binary = build_overlay_binary()
     if overlay_binary is None:
         return None, None
 
     overlay_text_path = chunks_dir / "_overlay.txt"
     overlay_text_path.write_text(
-        "Recording active.\nWaiting for chunk advice...",
+        (
+            f"Ask me how to play. I can see your screen. "
+            f"Listening: {current_microphone}"
+        ),
         encoding="utf-8",
     )
     proc = subprocess.Popen(
@@ -548,9 +582,14 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     )
     input_bytes = len(prompt.encode("utf-8")) + png_path.stat().st_size
     input_kib = input_bytes / 1024.0
+    screenshot_resolution = get_image_resolution(png_path)
+    latest_question = safe_chunk_text
     set_overlay_text(
         overlay_text_path,
-        f"Thinking...\nstep: input {input_kib:.1f}KiB, output --.-s",
+        (
+            f"Thinking...\n"
+            f"meta: {latest_question} | step: input {input_kib:.1f}KiB, output --.-s | res: {screenshot_resolution}"
+        ),
     )
 
     response_path = chunk_path.with_name(f"{chunk_path.stem}_advice_response.txt")
@@ -572,7 +611,7 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     print("==== Codex advice end ====", flush=True)
     print(f"[{chunk_path.stem}] advice: {advice_text}", flush=True)
     input_kib = input_bytes / 1024.0
-    overlay_meta = f"step: input {input_kib:.1f}KiB, output {elapsed:.2f}s"
+    overlay_meta = f"step: input {input_kib:.1f}KiB, output {elapsed:.2f}s | res: {screenshot_resolution}"
     advice_path.write_text(
         "Prompt:\n"
         f"{prompt.strip()}\n\n"
@@ -588,7 +627,10 @@ def generate_chunk_advice(chunks_dir, chunk_path, chunk_text, overlay_text_path)
     (chunks_dir / "_current_advice_chunk.txt").write_text(
         f"{chunk_path.stem}\n", encoding="utf-8"
     )
-    set_overlay_text(overlay_text_path, advice_text)
+    set_overlay_text(
+        overlay_text_path,
+        f"{advice_text}\nmeta: {latest_question} | {overlay_meta}",
+    )
     speak_text_for_session(advice_text, chunks_dir)
 
 
@@ -833,7 +875,7 @@ def main():
     print(f"Whisper input source: {'loopback' if args.whisper_loopback else 'mic'}")
     print(f"Live WAV input: {whisper_live_wav}")
     print("Transcribing live WAV input with Whisper Turbo (Torch API).")
-    overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir)
+    overlay_proc, overlay_text_path = start_persistent_overlay(chunks_dir, mic_name)
     screen_proc = None
     screen_segment_pattern_30fps = str(chunks_dir / "%06d_down8_30fps.mp4")
     screen_segment_pattern_1fps = str(chunks_dir / "%06d_down4_1fps.mp4")
