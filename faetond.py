@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+"""faetond HTTP service.
+
+Keep route changes in sync with `faetond.conf` (Nginx locations):
+- /sub and /sub/{ts}
+- /pub and /pub/{ts}
+- /png/{filename}
+"""
+
 import argparse
 import asyncio
 import os
@@ -198,47 +205,46 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 
         return Response(content=png_path.read_bytes(), media_type="image/png")
 
-    async def _sub_impl(start_ts: float):
+    async def _sub_impl(start_ts: float, req: Request):
         async def event_stream():
             cursor = start_ts
-            while True:
-                store.ensure_dirs()
-                sent_any = False
-                for event_ts, payload in _iter_events_after(store.events_dir, cursor):
-                    cursor = max(cursor, event_ts)
-                    sent_any = True
-                    yield f"id: {payload.get('ts', event_ts)}\n"
-                    for line in _format_kv_lines(payload).splitlines():
-                        yield f"data: {line}\n"
-                    yield "\n"
-                if not sent_any:
-                    try:
-                        await asyncio.wait_for(updates_ready.wait(), timeout=15.0)
-                        updates_ready.clear()
-                    except TimeoutError:
-                        yield ": keepalive\n\n"
+            try:
+                while True:
+                    if await req.is_disconnected():
+                        break
+
+                    store.ensure_dirs()
+                    sent_any = False
+                    for event_ts, payload in _iter_events_after(store.events_dir, cursor):
+                        if await req.is_disconnected():
+                            return
+                        cursor = max(cursor, event_ts)
+                        sent_any = True
+                        yield f"id: {payload.get('ts', event_ts)}\n"
+                        for line in _format_kv_lines(payload).splitlines():
+                            yield f"data: {line}\n"
+                        yield "\n"
+
+                    if not sent_any:
+                        try:
+                            await asyncio.wait_for(updates_ready.wait(), timeout=15.0)
+                            updates_ready.clear()
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+            except asyncio.CancelledError:
+                return
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @api.get("/")
-    async def sub_root():
-        return await _sub_impl(0.0)
-
     @api.get("/sub")
-    async def sub_root_alias():
-        return await _sub_impl(0.0)
+    async def sub_root_alias(req: Request):
+        return await _sub_impl(0.0, req)
 
     @api.get("/sub/{ts}")
-    async def sub_alias(ts: str):
+    async def sub_alias(ts: str, req: Request):
         if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
             raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
-        return await _sub_impl(float(ts))
-
-    @api.get("/{ts}")
-    async def sub(ts: str):
-        if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
-            raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
-        return await _sub_impl(float(ts))
+        return await _sub_impl(float(ts), req)
 
     return api
 
@@ -249,13 +255,19 @@ app = create_app()
 def main() -> None:
     parser = argparse.ArgumentParser(description="faetond local filesystem server")
     parser.add_argument("--host", default=os.environ.get("FAETOND_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("FAETOND_PORT", "8000")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("FAETOND_PORT", "8008")))
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     args = parser.parse_args()
 
     import uvicorn
 
-    uvicorn.run(create_app(args.data_dir), host=args.host, port=args.port)
+    uvicorn.run(
+        create_app(args.data_dir),
+        host=args.host,
+        port=args.port,
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get("FAETOND_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+    )
 
 
 if __name__ == "__main__":
