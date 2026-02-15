@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -603,6 +604,7 @@ void DownsampleBgra4x(const BYTE* src, int srcW, int srcH, std::vector<BYTE>& ds
 }
 
 bool CaptureWindowDownsampledPng(HWND hwnd, std::vector<BYTE>& pngBytes) {
+    try {
     if (!hwnd) {
         return false;
     }
@@ -653,7 +655,6 @@ bool CaptureWindowDownsampledPng(HWND hwnd, std::vector<BYTE>& pngBytes) {
         1,
         size);
     auto session = pool.CreateCaptureSession(item);
-    session.IsBorderRequired(false);
     session.IsCursorCaptureEnabled(false);
 
     HANDLE frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -737,6 +738,9 @@ bool CaptureWindowDownsampledPng(HWND hwnd, std::vector<BYTE>& pngBytes) {
     int dstH = 0;
     DownsampleBgra4x(srcPixels.data(), srcW, srcH, down, dstW, dstH);
     return EncodeBgraToPngBytes(down.data(), dstW, dstH, pngBytes);
+    } catch (...) {
+        return false;
+    }
 }
 
 std::string NewUuidV1Filename() {
@@ -819,13 +823,17 @@ bool UploadPng(const std::vector<BYTE>& pngBytes, const std::string& filename) {
 
 void CaptureLoop(AppState* state) {
     while (!state->stopCapture.load()) {
-        HWND target = GetForegroundCaptureWindow(state->requireTargetActive.load());
-        if (target) {
-            std::vector<BYTE> pngBytes;
-            if (CaptureWindowDownsampledPng(target, pngBytes)) {
-                std::string filename = NewUuidV1Filename();
-                UploadPng(pngBytes, filename);
+        try {
+            HWND target = GetForegroundCaptureWindow(state->requireTargetActive.load());
+            if (target) {
+                std::vector<BYTE> pngBytes;
+                if (CaptureWindowDownsampledPng(target, pngBytes)) {
+                    std::string filename = NewUuidV1Filename();
+                    UploadPng(pngBytes, filename);
+                }
             }
+        } catch (...) {
+            // Keep HUD alive even if capture APIs fail on this Windows build.
         }
         for (int waited = 0; waited < kCaptureIntervalMs && !state->stopCapture.load(); waited += 100) {
             Sleep(100);

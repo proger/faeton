@@ -29,6 +29,7 @@ MULTI_HOST_PROMPT = """You are supporting a Dota 2 team.
 Use the attached screenshot context from multiple hosts.
 You may see your past advice in the top-right HUD overlay; avoid repeating it unless game state changed.
 Look at the team composition and propose a team tactic to try given items and abilities that they have.
+Prioritise advice how to position the team on the map given information from each team member and current fighting activity.
 Include item advice when appropriate.
 Identify two heroes visible on screen and discuss their most likely interaction in this moment.
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
