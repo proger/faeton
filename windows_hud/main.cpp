@@ -1,23 +1,28 @@
 #include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <sapi.h>
 #include <shellapi.h>
+#include <winhttp.h>
 
+#include <atomic>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "sapi.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace {
 
 constexpr UINT_PTR kPollTimerId = 1;
 constexpr UINT kPollMs = 100;
-constexpr float kFontSize = 24.0f;
-constexpr float kMetaFontSize = 15.0f;
+constexpr float kFontSize = 14.0f;
+constexpr float kMetaFontSize = 9.0f;
 constexpr float kPadding = 20.0f;
 constexpr float kWidth = 720.0f;
 constexpr float kMinHeight = 140.0f;
@@ -29,9 +34,11 @@ constexpr BYTE kWindowOpacity = 217;  // ~85% of 255
 constexpr int kAppIconResId = 1;
 constexpr UINT kTrayCallbackMsg = WM_APP + 1;
 constexpr UINT kTrayExitCommand = 1001;
+constexpr UINT kTrayToggleSpeechCommand = 1002;
+constexpr wchar_t kDefaultSubUrl[] = L"https://approximate.fit/sub";
 
 struct AppState {
-    std::wstring textFile;
+    std::wstring subUrl;
 
     ID2D1Factory* d2dFactory = nullptr;
     IDWriteFactory* dwriteFactory = nullptr;
@@ -42,10 +49,16 @@ struct AppState {
     IDWriteTextFormat* mainFormat = nullptr;
     IDWriteTextFormat* metaFormat = nullptr;
 
-    std::wstring currentText = L"Recording active. Waiting for chunk advice...";
-    std::wstring mainText = L"Recording active. Waiting for chunk advice...";
+    std::wstring currentText = L"Recording active.";
+    std::wstring mainText = L"Recording active.";
     std::wstring metaText;
+    std::wstring latestText = L"Recording active.";
+    std::mutex textMutex;
+    std::thread subThread;
+    std::atomic<bool> stopSub{false};
     HICON appIcon = nullptr;
+    ISpVoice* voice = nullptr;
+    bool speechEnabled = true;
 };
 
 void SafeRelease(IUnknown* p) {
@@ -87,30 +100,10 @@ std::wstring ToLower(const std::wstring& in) {
     return out;
 }
 
-bool ReadFileUtf8(const std::wstring& path, std::wstring& outText) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string data = ss.str();
-
-    if (data.size() >= 3 &&
-        static_cast<unsigned char>(data[0]) == 0xEF &&
-        static_cast<unsigned char>(data[1]) == 0xBB &&
-        static_cast<unsigned char>(data[2]) == 0xBF) {
-        data = data.substr(3);
-    }
-
-    outText = Utf8ToWide(data);
-    return true;
-}
-
 void ParseMainAndMeta(AppState& s) {
     std::wstring trimmed = Trim(s.currentText);
     if (trimmed.empty()) {
-        trimmed = L"Recording active. Waiting for chunk advice...";
+        trimmed = L"Recording active.";
     }
 
     size_t lastNl = trimmed.find_last_of(L'\n');
@@ -131,7 +124,7 @@ void ParseMainAndMeta(AppState& s) {
 
     s.mainText = Trim(trimmed.substr(0, lastNl));
     if (s.mainText.empty()) {
-        s.mainText = L"Recording active. Waiting for chunk advice...";
+        s.mainText = L"Recording active.";
     }
     s.metaText = candidateMeta;
 }
@@ -242,22 +235,14 @@ bool ParseArgs(AppState& s) {
         return false;
     }
 
-    if (argc >= 2) {
-        s.textFile = argv[1];
+    if (argc >= 2 && argv[1] && argv[1][0] != L'\0') {
+        s.subUrl = argv[1];
     } else {
-        wchar_t modulePath[MAX_PATH] = {};
-        DWORD len = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
-        if (len > 0) {
-            std::filesystem::path p(modulePath);
-            p = p.parent_path() / L"overlay.txt";
-            if (std::filesystem::exists(p)) {
-                s.textFile = p.wstring();
-            }
-        }
+        s.subUrl = kDefaultSubUrl;
     }
 
     LocalFree(argv);
-    return !s.textFile.empty();
+    return !s.subUrl.empty();
 }
 
 bool AddTrayIcon(HWND hwnd, HICON icon) {
@@ -280,11 +265,13 @@ void RemoveTrayIcon(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-void ShowTrayMenu(HWND hwnd) {
+void ShowTrayMenu(HWND hwnd, AppState* state) {
     HMENU menu = CreatePopupMenu();
     if (!menu) {
         return;
     }
+    UINT speakFlags = MF_STRING | ((state && state->speechEnabled) ? MF_CHECKED : MF_UNCHECKED);
+    AppendMenuW(menu, speakFlags, kTrayToggleSpeechCommand, L"Speak");
     AppendMenuW(menu, MF_STRING, kTrayExitCommand, L"Exit");
 
     POINT pt{};
@@ -295,15 +282,183 @@ void ShowTrayMenu(HWND hwnd) {
     DestroyMenu(menu);
 }
 
-void RefreshTextIfChanged(HWND hwnd, AppState& s) {
-    std::wstring next;
-    if (!ReadFileUtf8(s.textFile, next)) {
+std::string TrimAscii(const std::string& in) {
+    size_t start = 0;
+    while (start < in.size() && (in[start] == ' ' || in[start] == '\n' || in[start] == '\r' || in[start] == '\t')) {
+        ++start;
+    }
+    size_t end = in.size();
+    while (end > start && (in[end - 1] == ' ' || in[end - 1] == '\n' || in[end - 1] == '\r' || in[end - 1] == '\t')) {
+        --end;
+    }
+    return in.substr(start, end - start);
+}
+
+void ApplySseLine(
+    const std::string& line,
+    std::string& eventText,
+    bool& hasText
+) {
+    if (line.rfind("data:", 0) != 0) {
+        return;
+    }
+    std::string payload = TrimAscii(line.substr(5));
+    size_t colon = payload.find(':');
+    if (colon == std::string::npos) {
+        return;
+    }
+    std::string key = TrimAscii(payload.substr(0, colon));
+    std::string value = TrimAscii(payload.substr(colon + 1));
+    if (key != "text") {
+        return;
+    }
+    size_t pos = 0;
+    while ((pos = value.find("\\n", pos)) != std::string::npos) {
+        value.replace(pos, 2, "\n");
+        pos += 1;
+    }
+    eventText = value;
+    hasText = true;
+}
+
+void SetLatestText(AppState& s, const std::wstring& text) {
+    std::lock_guard<std::mutex> lock(s.textMutex);
+    s.latestText = text.empty() ? L"Recording active." : text;
+}
+
+void SpeakLatestText(AppState& s, const std::wstring& text) {
+    if (!s.voice || !s.speechEnabled) {
+        return;
+    }
+    std::wstring spoken = Trim(text);
+    if (spoken.empty()) {
+        return;
+    }
+    s.voice->Speak(spoken.c_str(), SPF_ASYNC | SPF_PURGEBEFORESPEAK, nullptr);
+}
+
+void StopSpeaking(AppState& s) {
+    if (!s.voice) {
+        return;
+    }
+    s.voice->Speak(L"", SPF_ASYNC | SPF_PURGEBEFORESPEAK, nullptr);
+}
+
+void SubscribeLoop(AppState* state) {
+    URL_COMPONENTSW parts{};
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = static_cast<DWORD>(std::size(host));
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+    parts.dwSchemeLength = 1;
+
+    if (!WinHttpCrackUrl(state->subUrl.c_str(), 0, 0, &parts)) {
+        SetLatestText(*state, L"sub error: invalid URL");
         return;
     }
 
+    std::wstring hostName(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring pathName(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (pathName.empty()) {
+        pathName = L"/";
+    }
+    DWORD flags = (parts.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+
+    HINTERNET session = WinHttpOpen(L"faeton/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        SetLatestText(*state, L"sub error: WinHttpOpen failed");
+        return;
+    }
+    WinHttpSetTimeouts(session, 5000, 5000, 5000, 30000);
+
+    while (!state->stopSub.load()) {
+        HINTERNET connect = WinHttpConnect(session, hostName.c_str(), parts.nPort, 0);
+        if (!connect) {
+            SetLatestText(*state, L"sub: reconnecting...");
+            Sleep(1000);
+            continue;
+        }
+
+        HINTERNET request = WinHttpOpenRequest(connect, L"GET", pathName.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!request) {
+            WinHttpCloseHandle(connect);
+            SetLatestText(*state, L"sub: reconnecting...");
+            Sleep(1000);
+            continue;
+        }
+
+        WinHttpAddRequestHeaders(request, L"Accept: text/event-stream\r\nCache-Control: no-cache\r\n", -1, WINHTTP_ADDREQ_FLAG_ADD);
+        BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (ok) ok = WinHttpReceiveResponse(request, nullptr);
+        if (!ok) {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            SetLatestText(*state, L"sub: reconnecting...");
+            Sleep(1000);
+            continue;
+        }
+
+        std::string buf;
+        std::string line;
+        std::string eventText;
+        bool hasText = false;
+        while (!state->stopSub.load()) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(request, &avail)) {
+                break;
+            }
+            if (avail == 0) {
+                break;
+            }
+            std::string chunk(avail, '\0');
+            DWORD read = 0;
+            if (!WinHttpReadData(request, chunk.data(), avail, &read) || read == 0) {
+                break;
+            }
+            chunk.resize(read);
+            buf.append(chunk);
+
+            size_t nl = 0;
+            while ((nl = buf.find('\n')) != std::string::npos) {
+                line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                if (line.empty()) {
+                    if (hasText) {
+                        SetLatestText(*state, Utf8ToWide(eventText));
+                    }
+                    eventText.clear();
+                    hasText = false;
+                    continue;
+                }
+                ApplySseLine(line, eventText, hasText);
+            }
+        }
+
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        if (!state->stopSub.load()) {
+            Sleep(500);
+        }
+    }
+
+    WinHttpCloseHandle(session);
+}
+
+void RefreshTextIfChanged(HWND hwnd, AppState& s) {
+    std::wstring next;
+    {
+        std::lock_guard<std::mutex> lock(s.textMutex);
+        next = s.latestText;
+    }
     next = Trim(next);
     if (next.empty()) {
-        next = L"Recording active. Waiting for chunk advice...";
+        next = L"Recording active.";
     }
 
     if (next == s.currentText) {
@@ -312,6 +467,7 @@ void RefreshTextIfChanged(HWND hwnd, AppState& s) {
 
     s.currentText = next;
     ParseMainAndMeta(s);
+    SpeakLatestText(s, s.mainText);
 
     float h = ComputeHeightForText(s);
     MoveToTopRight(hwnd, kWidth, h);
@@ -336,18 +492,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case kTrayCallbackMsg: {
             if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
-                ShowTrayMenu(hwnd);
+                ShowTrayMenu(hwnd, s);
             } else if (lParam == WM_LBUTTONDBLCLK) {
                 DestroyWindow(hwnd);
             }
             return 0;
         }
         case WM_COMMAND: {
+            if (LOWORD(wParam) == kTrayToggleSpeechCommand && s) {
+                s->speechEnabled = !s->speechEnabled;
+                if (!s->speechEnabled) {
+                    StopSpeaking(*s);
+                }
+                return 0;
+            }
             if (LOWORD(wParam) == kTrayExitCommand) {
                 DestroyWindow(hwnd);
                 return 0;
             }
             return DefWindowProc(hwnd, msg, wParam, lParam);
+        }
+        case WM_LBUTTONDOWN: {
+            if (s) {
+                StopSpeaking(*s);
+            }
+            return 0;
         }
         case WM_TIMER: {
             if (s && wParam == kPollTimerId) {
@@ -422,9 +591,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+    HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     AppState state;
     if (!ParseArgs(state)) {
-        MessageBoxW(nullptr, L"Usage: faeton.exe <text-file>", L"faeton", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Failed to initialize subscribe URL.", L"faeton", MB_ICONERROR);
+        if (SUCCEEDED(comHr)) {
+            CoUninitialize();
+        }
         return 2;
     }
 
@@ -474,6 +647,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     state.metaFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     state.metaFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     state.metaFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, reinterpret_cast<void**>(&state.voice));
+    if (state.voice) {
+        state.voice->SetRate(5);
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -487,7 +664,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     wc.hIconSm = state.appIcon ? state.appIcon : LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
-    DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
     DWORD style = WS_POPUP;
 
     float initialHeight = ComputeHeightForText(state);
@@ -520,12 +697,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
 
+    state.subThread = std::thread(SubscribeLoop, &state);
     RefreshTextIfChanged(hwnd, state);
 
     MSG msg{};
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+    }
+
+    state.stopSub.store(true);
+    if (state.subThread.joinable()) {
+        state.subThread.join();
     }
 
     DiscardDeviceResources(state);
@@ -536,6 +719,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     if (state.appIcon) {
         DestroyIcon(state.appIcon);
         state.appIcon = nullptr;
+    }
+    SafeRelease(state.voice);
+    state.voice = nullptr;
+    if (SUCCEEDED(comHr)) {
+        CoUninitialize();
     }
 
     return static_cast<int>(msg.wParam);

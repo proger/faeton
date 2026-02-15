@@ -2,19 +2,7 @@
 setlocal
 
 rem Usage:
-rem   run_hud.bat C:\path\to\_overlay.txt
-
-if "%~1"=="" (
-  echo Usage: %~nx0 ^<text-file^>
-  exit /b 2
-)
-
-set "TEXT_FILE=%~1"
-
-if not exist "%TEXT_FILE%" (
-  echo Text file not found: "%TEXT_FILE%"
-  exit /b 3
-)
+rem   run_hud.bat
 
 call :ensure_msvc_env
 if errorlevel 1 (
@@ -38,7 +26,7 @@ if not exist "%EXE%" (
 taskkill /F /IM faeton.exe >nul 2>nul
 
 echo Starting HUD...
-"%EXE%" "%TEXT_FILE%"
+"%EXE%"
 set "RC=%ERRORLEVEL%"
 
 exit /b %RC%
