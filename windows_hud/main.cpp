@@ -1,32 +1,55 @@
 #include <windows.h>
 #include <d2d1.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <dwrite.h>
+#include <rpc.h>
 #include <sapi.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <wincodec.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "sapi.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace {
 
+struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDxgiInterfaceAccess : IUnknown {
+    virtual HRESULT __stdcall GetInterface(REFIID iid, void** p) = 0;
+};
+
 constexpr UINT_PTR kPollTimerId = 1;
 constexpr UINT kPollMs = 100;
-constexpr float kFontSize = 14.0f;
-constexpr float kMetaFontSize = 9.0f;
-constexpr float kPadding = 20.0f;
-constexpr float kWidth = 720.0f;
-constexpr float kMinHeight = 140.0f;
-constexpr float kMaxHeight = 420.0f;
+constexpr float kFontSize = 24.0f;
+constexpr float kMetaFontSize = 12.0f;
+constexpr float kPadding = 10.0f;
+constexpr float kMinWidth = 900.0f;
+constexpr float kMaxWidth = 1700.0f;
+constexpr float kMinHeight = 180.0f;
+constexpr float kMaxHeight = 2000.0f;
 constexpr float kTopMargin = 30.0f;
 constexpr float kRightMargin = 30.0f;
 constexpr float kCornerRadius = 14.0f;
@@ -35,7 +58,12 @@ constexpr int kAppIconResId = 1;
 constexpr UINT kTrayCallbackMsg = WM_APP + 1;
 constexpr UINT kTrayExitCommand = 1001;
 constexpr UINT kTrayToggleSpeechCommand = 1002;
+constexpr UINT kTrayRequireActiveCommand = 1003;
 constexpr wchar_t kDefaultSubUrl[] = L"https://approximate.fit/sub";
+constexpr wchar_t kUploadBaseUrl[] = L"https://approximate.fit";
+constexpr wchar_t kCaptureTargetExe[] = L"dota2.exe";
+constexpr int kCaptureIntervalMs = 5000;
+constexpr int kDownsampleDivisor = 4;
 
 struct AppState {
     std::wstring subUrl;
@@ -55,10 +83,13 @@ struct AppState {
     std::wstring latestText = L"Recording active.";
     std::mutex textMutex;
     std::thread subThread;
+    std::thread captureThread;
     std::atomic<bool> stopSub{false};
+    std::atomic<bool> stopCapture{false};
     HICON appIcon = nullptr;
     ISpVoice* voice = nullptr;
     bool speechEnabled = true;
+    std::atomic<bool> requireTargetActive{false};
 };
 
 void SafeRelease(IUnknown* p) {
@@ -98,6 +129,12 @@ std::wstring ToLower(const std::wstring& in) {
         ch = static_cast<wchar_t>(towlower(ch));
     }
     return out;
+}
+
+std::wstring BaseNameLower(const std::wstring& path) {
+    size_t sep = path.find_last_of(L"\\/");
+    std::wstring base = (sep == std::wstring::npos) ? path : path.substr(sep + 1);
+    return ToLower(base);
 }
 
 void ParseMainAndMeta(AppState& s) {
@@ -140,6 +177,18 @@ void MoveToTopRight(HWND hwnd, float width, float height) {
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(width), static_cast<int>(height), SWP_NOACTIVATE);
 }
 
+float MaxHeightForMonitor(HWND hwnd) {
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfo(mon, &mi);
+    float available = static_cast<float>(mi.rcWork.bottom - mi.rcWork.top) - kTopMargin - 20.0f;
+    if (available < kMinHeight) {
+        return kMinHeight;
+    }
+    return available;
+}
+
 HRESULT EnsureDeviceResources(HWND hwnd, AppState& s) {
     if (s.rt) {
         return S_OK;
@@ -158,6 +207,8 @@ HRESULT EnsureDeviceResources(HWND hwnd, AppState& s) {
     if (FAILED(hr)) {
         return hr;
     }
+    // Keep D2D layout coordinates in pixel units to match Win32 window sizing math.
+    s.rt->SetDpi(96.0f, 96.0f);
 
     hr = s.rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.95f), &s.fgBrush);
     if (FAILED(hr)) return hr;
@@ -179,7 +230,7 @@ void DiscardDeviceResources(AppState& s) {
     s.rt = nullptr;
 }
 
-float ComputeHeightForText(AppState& s) {
+float ComputeHeightForText(AppState& s, float panelWidth) {
     if (!s.dwriteFactory) {
         return kMinHeight;
     }
@@ -187,7 +238,7 @@ float ComputeHeightForText(AppState& s) {
     IDWriteTextLayout* mainLayout = nullptr;
     IDWriteTextLayout* metaLayout = nullptr;
 
-    float textAreaWidth = kWidth - (kPadding * 2.0f);
+    float textAreaWidth = panelWidth - (kPadding * 2.0f);
 
     HRESULT hr = s.dwriteFactory->CreateTextLayout(
         s.mainText.c_str(),
@@ -202,6 +253,9 @@ float ComputeHeightForText(AppState& s) {
 
     DWRITE_TEXT_METRICS mainMetrics{};
     mainLayout->GetMetrics(&mainMetrics);
+    DWRITE_OVERHANG_METRICS mainOverhang{};
+    mainLayout->GetOverhangMetrics(&mainOverhang);
+    float mainHeight = mainMetrics.height + mainOverhang.top + mainOverhang.bottom + 2.0f;
 
     float metaHeight = 0.0f;
     if (!s.metaText.empty()) {
@@ -215,17 +269,88 @@ float ComputeHeightForText(AppState& s) {
         if (SUCCEEDED(hr)) {
             DWRITE_TEXT_METRICS metaMetrics{};
             metaLayout->GetMetrics(&metaMetrics);
-            metaHeight = metaMetrics.height + 6.0f;
+            DWRITE_OVERHANG_METRICS metaOverhang{};
+            metaLayout->GetOverhangMetrics(&metaOverhang);
+            metaHeight = metaMetrics.height + metaOverhang.top + metaOverhang.bottom + 6.0f;
         }
     }
 
-    float h = (kPadding * 2.0f) + mainMetrics.height + metaHeight;
+    float h = (kPadding * 2.0f) + mainHeight + metaHeight;
     if (h < kMinHeight) h = kMinHeight;
     if (h > kMaxHeight) h = kMaxHeight;
 
     SafeRelease(mainLayout);
     SafeRelease(metaLayout);
     return h;
+}
+
+float MaxWidthForMonitor(HWND hwnd) {
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfo(mon, &mi);
+    float available = static_cast<float>(mi.rcWork.right - mi.rcWork.left) - kRightMargin - 20.0f;
+    if (available < kMinWidth) {
+        return kMinWidth;
+    }
+    return available;
+}
+
+float ComputeDesiredWidth(HWND hwnd, AppState& s) {
+    if (!s.dwriteFactory || !s.mainFormat) {
+        return kMinWidth;
+    }
+    IDWriteTextLayout* mainLayout = nullptr;
+    IDWriteTextLayout* metaLayout = nullptr;
+    DWRITE_WORD_WRAPPING originalWrap = DWRITE_WORD_WRAPPING_WRAP;
+    // Use no-wrap width measurement to pick a panel width, then restore wrapping.
+    s.mainFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    HRESULT hr = s.dwriteFactory->CreateTextLayout(
+        s.mainText.c_str(),
+        static_cast<UINT32>(s.mainText.size()),
+        s.mainFormat,
+        4096.0f,
+        3000.0f,
+        &mainLayout);
+    s.mainFormat->SetWordWrapping(originalWrap);
+    if (FAILED(hr) || !mainLayout) {
+        return kMinWidth;
+    }
+    DWRITE_TEXT_METRICS mainM{};
+    mainLayout->GetMetrics(&mainM);
+    DWRITE_OVERHANG_METRICS mainOv{};
+    mainLayout->GetOverhangMetrics(&mainOv);
+    float maxTextW = mainM.widthIncludingTrailingWhitespace + mainOv.left + mainOv.right;
+    SafeRelease(mainLayout);
+
+    if (!s.metaText.empty() && s.metaFormat) {
+        DWRITE_WORD_WRAPPING metaWrap = DWRITE_WORD_WRAPPING_WRAP;
+        s.metaFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        hr = s.dwriteFactory->CreateTextLayout(
+            s.metaText.c_str(),
+            static_cast<UINT32>(s.metaText.size()),
+            s.metaFormat,
+            4096.0f,
+            1000.0f,
+            &metaLayout);
+        s.metaFormat->SetWordWrapping(metaWrap);
+        if (SUCCEEDED(hr) && metaLayout) {
+            DWRITE_TEXT_METRICS metaM{};
+            metaLayout->GetMetrics(&metaM);
+            DWRITE_OVERHANG_METRICS metaOv{};
+            metaLayout->GetOverhangMetrics(&metaOv);
+            float metaTextW = metaM.widthIncludingTrailingWhitespace + metaOv.left + metaOv.right;
+            if (metaTextW > maxTextW) maxTextW = metaTextW;
+        }
+        SafeRelease(metaLayout);
+    }
+
+    float wanted = maxTextW + (kPadding * 2.0f) + 12.0f;
+    float maxW = MaxWidthForMonitor(hwnd);
+    if (wanted < kMinWidth) wanted = kMinWidth;
+    if (wanted > kMaxWidth) wanted = kMaxWidth;
+    if (wanted > maxW) wanted = maxW;
+    return wanted;
 }
 
 bool ParseArgs(AppState& s) {
@@ -272,6 +397,8 @@ void ShowTrayMenu(HWND hwnd, AppState* state) {
     }
     UINT speakFlags = MF_STRING | ((state && state->speechEnabled) ? MF_CHECKED : MF_UNCHECKED);
     AppendMenuW(menu, speakFlags, kTrayToggleSpeechCommand, L"Speak");
+    UINT activeFlags = MF_STRING | ((state && state->requireTargetActive.load()) ? MF_CHECKED : MF_UNCHECKED);
+    AppendMenuW(menu, activeFlags, kTrayRequireActiveCommand, L"Require dota2.exe active");
     AppendMenuW(menu, MF_STRING, kTrayExitCommand, L"Exit");
 
     POINT pt{};
@@ -342,6 +469,368 @@ void StopSpeaking(AppState& s) {
         return;
     }
     s.voice->Speak(L"", SPF_ASYNC | SPF_PURGEBEFORESPEAK, nullptr);
+}
+
+bool IsCaptureTargetActive() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) {
+        return false;
+    }
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) {
+        return false;
+    }
+    wchar_t pathBuf[MAX_PATH * 2] = {};
+    DWORD pathLen = static_cast<DWORD>(std::size(pathBuf));
+    bool ok = QueryFullProcessImageNameW(proc, 0, pathBuf, &pathLen) != FALSE;
+    CloseHandle(proc);
+    if (!ok) {
+        return false;
+    }
+    std::wstring exe = BaseNameLower(pathBuf);
+    return exe == kCaptureTargetExe;
+}
+
+HWND GetForegroundCaptureWindow(bool requireTargetExe) {
+    HWND fg = GetForegroundWindow();
+    if (!fg) {
+        return nullptr;
+    }
+    if (!requireTargetExe) {
+        return fg;
+    }
+    return IsCaptureTargetActive() ? fg : nullptr;
+}
+
+bool EncodeBgraToPngBytes(const BYTE* bgra, int width, int height, std::vector<BYTE>& out) {
+    out.clear();
+    if (!bgra || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    IStream* stream = nullptr;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    bool success = false;
+
+    if (FAILED(CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_IWICImagingFactory,
+            reinterpret_cast<void**>(&factory)))) {
+        goto done;
+    }
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
+        goto done;
+    }
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder))) {
+        goto done;
+    }
+    if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) {
+        goto done;
+    }
+    if (FAILED(encoder->CreateNewFrame(&frame, &props))) {
+        goto done;
+    }
+    if (FAILED(frame->Initialize(props))) {
+        goto done;
+    }
+    if (FAILED(frame->SetSize(static_cast<UINT>(width), static_cast<UINT>(height)))) {
+        goto done;
+    }
+    if (FAILED(frame->SetPixelFormat(&format))) {
+        goto done;
+    }
+    UINT stride = static_cast<UINT>(width * 4);
+    UINT dataSize = static_cast<UINT>(width * height * 4);
+    if (FAILED(frame->WritePixels(static_cast<UINT>(height), stride, dataSize, const_cast<BYTE*>(bgra)))) {
+        goto done;
+    }
+    if (FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
+        goto done;
+    }
+
+    HGLOBAL hGlobal = nullptr;
+    if (FAILED(GetHGlobalFromStream(stream, &hGlobal)) || !hGlobal) {
+        goto done;
+    }
+    SIZE_T sz = GlobalSize(hGlobal);
+    if (sz == 0) {
+        goto done;
+    }
+    void* mem = GlobalLock(hGlobal);
+    if (!mem) {
+        goto done;
+    }
+    out.assign(static_cast<BYTE*>(mem), static_cast<BYTE*>(mem) + sz);
+    GlobalUnlock(hGlobal);
+    success = true;
+
+done:
+    SafeRelease(props);
+    SafeRelease(frame);
+    SafeRelease(encoder);
+    SafeRelease(factory);
+    SafeRelease(stream);
+    return success;
+}
+
+void DownsampleBgra4x(const BYTE* src, int srcW, int srcH, std::vector<BYTE>& dst, int& dstW, int& dstH) {
+    dstW = max(1, srcW / kDownsampleDivisor);
+    dstH = max(1, srcH / kDownsampleDivisor);
+    dst.assign(static_cast<size_t>(dstW) * static_cast<size_t>(dstH) * 4, 0);
+    for (int y = 0; y < dstH; ++y) {
+        int sy = (y * srcH) / dstH;
+        for (int x = 0; x < dstW; ++x) {
+            int sx = (x * srcW) / dstW;
+            const BYTE* p = src + ((static_cast<size_t>(sy) * static_cast<size_t>(srcW) + sx) * 4);
+            BYTE* q = dst.data() + ((static_cast<size_t>(y) * static_cast<size_t>(dstW) + x) * 4);
+            q[0] = p[0];
+            q[1] = p[1];
+            q[2] = p[2];
+            q[3] = p[3];
+        }
+    }
+}
+
+bool CaptureWindowDownsampledPng(HWND hwnd, std::vector<BYTE>& pngBytes) {
+    if (!hwnd) {
+        return false;
+    }
+
+    winrt::com_ptr<ID3D11Device> d3dDevice;
+    winrt::com_ptr<ID3D11DeviceContext> d3dContext;
+    D3D_FEATURE_LEVEL fl;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        nullptr,
+        0,
+        D3D11_SDK_VERSION,
+        d3dDevice.put(),
+        &fl,
+        d3dContext.put());
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    winrt::com_ptr<IDXGIDevice> dxgiDevice;
+    if (FAILED(d3dDevice->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void()))) {
+        return false;
+    }
+    winrt::com_ptr<IInspectable> inspectable;
+    if (FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put()))) {
+        return false;
+    }
+    auto winrtDevice = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+
+    auto interop = winrt::get_activation_factory<
+        winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+        IGraphicsCaptureItemInterop>();
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+    if (FAILED(interop->CreateForWindow(hwnd, winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(), winrt::put_abi(item)))) {
+        return false;
+    }
+    auto size = item.Size();
+    if (size.Width <= 0 || size.Height <= 0) {
+        return false;
+    }
+
+    auto pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        winrtDevice,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        1,
+        size);
+    auto session = pool.CreateCaptureSession(item);
+    session.IsBorderRequired(false);
+    session.IsCursorCaptureEnabled(false);
+
+    HANDLE frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!frameEvent) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+    winrt::event_token token = pool.FrameArrived([&](auto&, auto&) {
+        SetEvent(frameEvent);
+    });
+
+    session.StartCapture();
+    DWORD waitRc = WaitForSingleObject(frameEvent, 2000);
+    CloseHandle(frameEvent);
+    pool.FrameArrived(token);
+    if (waitRc != WAIT_OBJECT_0) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+
+    auto frame = pool.TryGetNextFrame();
+    if (!frame) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+
+    auto surface = frame.Surface();
+    auto unk = surface.as<IUnknown>();
+    winrt::com_ptr<IDirect3DDxgiInterfaceAccess> access;
+    if (FAILED(unk->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), access.put_void()))) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+    winrt::com_ptr<ID3D11Texture2D> gpuTex;
+    if (FAILED(access->GetInterface(__uuidof(ID3D11Texture2D), gpuTex.put_void()))) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    gpuTex->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC staging = desc;
+    staging.BindFlags = 0;
+    staging.MiscFlags = 0;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging.Usage = D3D11_USAGE_STAGING;
+    winrt::com_ptr<ID3D11Texture2D> cpuTex;
+    if (FAILED(d3dDevice->CreateTexture2D(&staging, nullptr, cpuTex.put()))) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+    d3dContext->CopyResource(cpuTex.get(), gpuTex.get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(d3dContext->Map(cpuTex.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        session.Close();
+        pool.Close();
+        return false;
+    }
+
+    int srcW = static_cast<int>(desc.Width);
+    int srcH = static_cast<int>(desc.Height);
+    std::vector<BYTE> srcPixels(static_cast<size_t>(srcW) * static_cast<size_t>(srcH) * 4);
+    for (int y = 0; y < srcH; ++y) {
+        const BYTE* row = static_cast<const BYTE*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
+        memcpy(srcPixels.data() + static_cast<size_t>(y) * static_cast<size_t>(srcW) * 4, row, static_cast<size_t>(srcW) * 4);
+    }
+    d3dContext->Unmap(cpuTex.get(), 0);
+
+    session.Close();
+    pool.Close();
+
+    std::vector<BYTE> down;
+    int dstW = 0;
+    int dstH = 0;
+    DownsampleBgra4x(srcPixels.data(), srcW, srcH, down, dstW, dstH);
+    return EncodeBgraToPngBytes(down.data(), dstW, dstH, pngBytes);
+}
+
+std::string NewUuidV1Filename() {
+    UUID id{};
+    if (UuidCreateSequential(&id) != RPC_S_OK && UuidCreate(&id) != RPC_S_OK) {
+        return "";
+    }
+    RPC_CSTR s = nullptr;
+    if (UuidToStringA(&id, &s) != RPC_S_OK || !s) {
+        return "";
+    }
+    std::string out(reinterpret_cast<char*>(s));
+    RpcStringFreeA(&s);
+    out += ".png";
+    return out;
+}
+
+bool UploadPng(const std::vector<BYTE>& pngBytes, const std::string& filename) {
+    if (pngBytes.empty() || filename.empty()) {
+        return false;
+    }
+
+    std::wstring fullUrl = std::wstring(kUploadBaseUrl) + L"/png/" + Utf8ToWide(filename);
+    URL_COMPONENTSW parts{};
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = static_cast<DWORD>(std::size(host));
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+    parts.dwSchemeLength = 1;
+    if (!WinHttpCrackUrl(fullUrl.c_str(), 0, 0, &parts)) {
+        return false;
+    }
+
+    std::wstring hostName(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring pathName(parts.lpszUrlPath, parts.dwUrlPathLength);
+    DWORD flags = (parts.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+
+    HINTERNET session = WinHttpOpen(L"faeton/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        return false;
+    }
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 15000);
+    HINTERNET connect = WinHttpConnect(session, hostName.c_str(), parts.nPort, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", pathName.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    BOOL ok = WinHttpSendRequest(
+        request,
+        L"Content-Type: image/png\r\n",
+        -1L,
+        const_cast<BYTE*>(pngBytes.data()),
+        static_cast<DWORD>(pngBytes.size()),
+        static_cast<DWORD>(pngBytes.size()),
+        0);
+    if (ok) {
+        ok = WinHttpReceiveResponse(request, nullptr);
+    }
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (ok) {
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok && status >= 200 && status < 300;
+}
+
+void CaptureLoop(AppState* state) {
+    while (!state->stopCapture.load()) {
+        HWND target = GetForegroundCaptureWindow(state->requireTargetActive.load());
+        if (target) {
+            std::vector<BYTE> pngBytes;
+            if (CaptureWindowDownsampledPng(target, pngBytes)) {
+                std::string filename = NewUuidV1Filename();
+                UploadPng(pngBytes, filename);
+            }
+        }
+        for (int waited = 0; waited < kCaptureIntervalMs && !state->stopCapture.load(); waited += 100) {
+            Sleep(100);
+        }
+    }
 }
 
 void SubscribeLoop(AppState* state) {
@@ -461,17 +950,30 @@ void RefreshTextIfChanged(HWND hwnd, AppState& s) {
         next = L"Recording active.";
     }
 
-    if (next == s.currentText) {
-        return;
+    bool changed = (next != s.currentText);
+    if (changed) {
+        s.currentText = next;
+        ParseMainAndMeta(s);
+        SpeakLatestText(s, s.mainText);
     }
 
-    s.currentText = next;
-    ParseMainAndMeta(s);
-    SpeakLatestText(s, s.mainText);
+    float w = ComputeDesiredWidth(hwnd, s);
+    float h = ComputeHeightForText(s, w);
+    float monitorMax = MaxHeightForMonitor(hwnd);
+    if (h > monitorMax) {
+        h = monitorMax;
+    }
 
-    float h = ComputeHeightForText(s);
-    MoveToTopRight(hwnd, kWidth, h);
-    InvalidateRect(hwnd, nullptr, FALSE);
+    RECT rc{};
+    GetWindowRect(hwnd, &rc);
+    int currentW = rc.right - rc.left;
+    int currentH = rc.bottom - rc.top;
+    int desiredW = static_cast<int>(w);
+    int desiredH = static_cast<int>(h);
+    if (currentW != desiredW || currentH != desiredH || changed) {
+        MoveToTopRight(hwnd, w, h);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -506,6 +1008,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 return 0;
             }
+            if (LOWORD(wParam) == kTrayRequireActiveCommand && s) {
+                s->requireTargetActive.store(!s->requireTargetActive.load());
+                return 0;
+            }
             if (LOWORD(wParam) == kTrayExitCommand) {
                 DestroyWindow(hwnd);
                 return 0;
@@ -522,6 +1028,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (s && wParam == kPollTimerId) {
                 RefreshTextIfChanged(hwnd, *s);
             }
+            return 0;
+        }
+        case WM_SIZE: {
+            if (s && s->rt) {
+                UINT w = static_cast<UINT>(LOWORD(lParam));
+                UINT h = static_cast<UINT>(HIWORD(lParam));
+                if (w > 0 && h > 0) {
+                    s->rt->Resize(D2D1::SizeU(w, h));
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         case WM_ERASEBKGND:
@@ -546,27 +1063,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 D2D1::RoundedRect(bounds, kCornerRadius, kCornerRadius),
                 s->bgBrush);
 
-            float textAreaWidth = kWidth - (kPadding * 2.0f);
-            D2D1_RECT_F mainRect = D2D1::RectF(kPadding, kPadding, kPadding + textAreaWidth, bounds.bottom - kPadding);
-            s->rt->DrawTextW(
-                s->mainText.c_str(),
-                static_cast<UINT32>(s->mainText.size()),
-                s->mainFormat,
-                mainRect,
-                s->fgBrush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL);
-
+            float textAreaWidth = bounds.right - bounds.left - (kPadding * 2.0f);
+            float metaReserve = 0.0f;
             if (!s->metaText.empty()) {
-                D2D1_RECT_F metaRect = D2D1::RectF(kPadding, bounds.bottom - kPadding - 24.0f, kPadding + textAreaWidth, bounds.bottom - 6.0f);
-                s->rt->DrawTextW(
+                IDWriteTextLayout* metaMeasure = nullptr;
+                HRESULT mmhr = s->dwriteFactory->CreateTextLayout(
                     s->metaText.c_str(),
                     static_cast<UINT32>(s->metaText.size()),
                     s->metaFormat,
-                    metaRect,
-                    s->metaBrush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL);
+                    textAreaWidth,
+                    100.0f,
+                    &metaMeasure);
+                if (SUCCEEDED(mmhr) && metaMeasure) {
+                    DWRITE_TEXT_METRICS mm{};
+                    metaMeasure->GetMetrics(&mm);
+                    DWRITE_OVERHANG_METRICS mo{};
+                    metaMeasure->GetOverhangMetrics(&mo);
+                    metaReserve = mm.height + mo.top + mo.bottom + 6.0f;
+                }
+                SafeRelease(metaMeasure);
+            }
+            IDWriteTextLayout* mainLayout = nullptr;
+            HRESULT lhr = s->dwriteFactory->CreateTextLayout(
+                s->mainText.c_str(),
+                static_cast<UINT32>(s->mainText.size()),
+                s->mainFormat,
+                textAreaWidth,
+                bounds.bottom - (kPadding * 2.0f) - metaReserve,
+                &mainLayout);
+            if (SUCCEEDED(lhr) && mainLayout) {
+                s->rt->DrawTextLayout(
+                    D2D1::Point2F(kPadding, kPadding),
+                    mainLayout,
+                    s->fgBrush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                SafeRelease(mainLayout);
+            }
+
+            if (!s->metaText.empty()) {
+                IDWriteTextLayout* metaLayout = nullptr;
+                float metaMaxHeight = 40.0f;
+                HRESULT mhr = s->dwriteFactory->CreateTextLayout(
+                    s->metaText.c_str(),
+                    static_cast<UINT32>(s->metaText.size()),
+                    s->metaFormat,
+                    textAreaWidth,
+                    metaMaxHeight,
+                    &metaLayout);
+                if (SUCCEEDED(mhr) && metaLayout) {
+                    DWRITE_TEXT_METRICS metaMetrics{};
+                    metaLayout->GetMetrics(&metaMetrics);
+                    float metaY = bounds.bottom - kPadding - metaMetrics.height;
+                    s->rt->DrawTextLayout(
+                        D2D1::Point2F(kPadding, metaY),
+                        metaLayout,
+                        s->metaBrush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                    SafeRelease(metaLayout);
+                }
             }
 
             HRESULT hr = s->rt->EndDraw();
@@ -667,7 +1221,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
     DWORD style = WS_POPUP;
 
-    float initialHeight = ComputeHeightForText(state);
+    float initialWidth = kMinWidth;
+    float initialHeight = ComputeHeightForText(state, initialWidth);
 
     HWND hwnd = CreateWindowExW(
         exStyle,
@@ -676,7 +1231,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         style,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        static_cast<int>(kWidth),
+        static_cast<int>(initialWidth),
         static_cast<int>(initialHeight),
         nullptr,
         nullptr,
@@ -691,13 +1246,33 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    initialWidth = ComputeDesiredWidth(hwnd, state);
+    initialHeight = ComputeHeightForText(state, initialWidth);
+    float monitorMax = MaxHeightForMonitor(hwnd);
+    if (initialHeight > monitorMax) {
+        initialHeight = monitorMax;
+    }
     SetLayeredWindowAttributes(hwnd, 0, kWindowOpacity, LWA_ALPHA);
-    MoveToTopRight(hwnd, kWidth, initialHeight);
+    MoveToTopRight(hwnd, initialWidth, initialHeight);
+
+    RECT clientRc{};
+    RECT winRc{};
+    GetClientRect(hwnd, &clientRc);
+    GetWindowRect(hwnd, &winRc);
+    std::printf(
+        "faeton hud size: kWidth=%.1f client=%ldx%ld window=%ldx%ld\n",
+        initialWidth,
+        static_cast<long>(clientRc.right - clientRc.left),
+        static_cast<long>(clientRc.bottom - clientRc.top),
+        static_cast<long>(winRc.right - winRc.left),
+        static_cast<long>(winRc.bottom - winRc.top));
+    std::fflush(stdout);
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
 
     state.subThread = std::thread(SubscribeLoop, &state);
+    state.captureThread = std::thread(CaptureLoop, &state);
     RefreshTextIfChanged(hwnd, state);
 
     MSG msg{};
@@ -707,8 +1282,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     }
 
     state.stopSub.store(true);
+    state.stopCapture.store(true);
     if (state.subThread.joinable()) {
         state.subThread.join();
+    }
+    if (state.captureThread.joinable()) {
+        state.captureThread.join();
     }
 
     DiscardDeviceResources(state);
