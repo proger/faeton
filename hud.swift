@@ -5,8 +5,13 @@ import ScreenCaptureKit
 import UniformTypeIdentifiers
 import Darwin
 
+struct LaunchConfig {
+    let textFileURL: URL?
+}
+
 final class OverlayApp: NSObject, NSApplicationDelegate {
     private let subBaseURL = URL(string: "https://approximate.fit/sub")!
+    private let config: LaunchConfig
     private let panel = NSPanel(
         contentRect: NSRect(x: 0, y: 0, width: 620, height: 240),
         styleMask: [.borderless, .nonactivatingPanel],
@@ -16,8 +21,14 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     private let textField = NSTextField(wrappingLabelWithString: "")
     private let metaField = NSTextField(wrappingLabelWithString: "")
     private var captureTimer: Timer?
+    private var fileTimer: Timer?
     private var subTask: Task<Void, Never>?
     private var lastText = ""
+
+    init(config: LaunchConfig) {
+        self.config = config
+        super.init()
+    }
 
     private func log(_ msg: String) {
         print(msg)
@@ -29,11 +40,20 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         setupWindow()
         layout(text: "Recording active.")
         panel.orderFrontRegardless()
-        startSubscribeLoop()
-        captureTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task {
-                await self.captureAndUploadIfActive()
+        if let textFileURL = config.textFileURL {
+            log("Faeton HUD started in single-player mode. I read overlay text from \(textFileURL.path). Screenshot uploads are disabled.")
+            refreshTextFromFile()
+            fileTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.refreshTextFromFile()
+            }
+        } else {
+            log("Faeton HUD started in multiplayer mode. I subscribe to live text updates from \(subBaseURL.absoluteString)/0 and upload screenshots every 5 seconds.")
+            startSubscribeLoop()
+            captureTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                Task {
+                    await self.captureAndUploadIfActive()
+                }
             }
         }
     }
@@ -204,10 +224,18 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        fileTimer?.invalidate()
+        fileTimer = nil
         captureTimer?.invalidate()
         captureTimer = nil
         subTask?.cancel()
         subTask = nil
+    }
+
+    private func refreshTextFromFile() {
+        guard let textFileURL = config.textFileURL else { return }
+        guard let text = try? String(contentsOf: textFileURL, encoding: .utf8) else { return }
+        updateText(text)
     }
 
     private func isDotaFrontmost() -> Bool {
@@ -332,6 +360,17 @@ private extension NSScreen {
 }
 
 let app = NSApplication.shared
-let delegate = OverlayApp()
+var textFileURL: URL?
+var i = 1
+while i < CommandLine.arguments.count {
+    let arg = CommandLine.arguments[i]
+    if arg == "--text-file", i + 1 < CommandLine.arguments.count {
+        textFileURL = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+        i += 2
+        continue
+    }
+    i += 1
+}
+let delegate = OverlayApp(config: LaunchConfig(textFileURL: textFileURL))
 app.delegate = delegate
 app.run()
