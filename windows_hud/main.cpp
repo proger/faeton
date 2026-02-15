@@ -44,11 +44,11 @@ struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDxgiInt
 
 constexpr UINT_PTR kPollTimerId = 1;
 constexpr UINT kPollMs = 100;
-constexpr float kFontSize = 24.0f;
+constexpr float kFontSize = 14.0f;
 constexpr float kMetaFontSize = 12.0f;
 constexpr float kPadding = 10.0f;
-constexpr float kMinWidth = 900.0f;
-constexpr float kMaxWidth = 1700.0f;
+constexpr float kMinWidth = 300.0f;
+constexpr float kMaxWidth = 567.0f;
 constexpr float kMinHeight = 180.0f;
 constexpr float kMaxHeight = 2000.0f;
 constexpr float kTopMargin = 30.0f;
@@ -173,8 +173,8 @@ void MoveToTopRight(HWND hwnd, float width, float height) {
     mi.cbSize = sizeof(mi);
     GetMonitorInfo(mon, &mi);
 
-    int x = mi.rcWork.right - static_cast<int>(width) - static_cast<int>(kRightMargin);
-    int y = mi.rcWork.top + static_cast<int>(kTopMargin);
+    int x = mi.rcWork.left + static_cast<int>(kRightMargin);
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - static_cast<int>(height)) / 2;
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(width), static_cast<int>(height), SWP_NOACTIVATE);
 }
 

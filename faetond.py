@@ -30,6 +30,8 @@ Use the attached screenshot context from multiple hosts.
 You may see your past advice in the top-right HUD overlay; avoid repeating it unless game state changed.
 Look at the team composition and propose a team tactic to try given items and abilities that they have.
 Prioritise advice how to position the team on the map given information from each team member and current fighting activity.
+Prioritise early-game positioning guidance (lanes, rune control, rotations, vision posture) before mid/late-game macro plans.
+When in pregame screens, advise 5-hero combos that fit together and say why.
 Include item advice when appropriate.
 Identify two heroes visible on screen and discuss their most likely interaction in this moment.
 Prioritize guidance that stays useful over the next minute: durable principles, likely next decisions, and fallback plans.
@@ -205,11 +207,14 @@ def _run_codex_for_rows(rows: list[dict[str, str]], store: "Store") -> str | Non
         with codex_log.open("a", encoding="utf-8") as f:
             f.write(f"{log_ts}\tstatus=exception\thosts={len(rows)}\n")
         response_log.write_text("codex invocation exception", encoding="utf-8")
+        print("codex error: invocation exception", flush=True)
         return None
     if result.returncode != 0:
+        err = (result.stderr or "codex failed").strip()
         with codex_log.open("a", encoding="utf-8") as f:
             f.write(f"{log_ts}\tstatus=error\thosts={len(rows)}\n")
-        response_log.write_text(result.stderr or "codex failed", encoding="utf-8")
+        response_log.write_text(err, encoding="utf-8")
+        print(f"codex error stderr: {err}", flush=True)
         return None
 
     out = (result.stdout or "").strip()

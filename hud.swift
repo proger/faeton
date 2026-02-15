@@ -25,7 +25,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         setupWindow()
         layout(text: "Recording active.")
         panel.orderFrontRegardless()
@@ -117,8 +117,8 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         let height = min(max(neededHeight, 220), maxHeight)
 
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = screenFrame.maxX - width - pad
-        let y = screenFrame.maxY - height - pad
+        let x = screenFrame.minX + pad
+        let y = screenFrame.minY + ((screenFrame.height - height) / 2)
 
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
         let metaHeight = metaLine.isEmpty ? 0 : metaFit.height
