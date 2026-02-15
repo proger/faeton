@@ -229,19 +229,8 @@ def web():
     async def sub_root():
         return await _sub_impl(0.0)
 
-    @api.get("/sub")
-    async def sub_root_alias():
-        return await _sub_impl(0.0)
-
     @api.get("/{ts}")
     async def sub(ts: str):
-        if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
-            raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
-        start_ts = float(ts)
-        return await _sub_impl(start_ts)
-
-    @api.get("/sub/{ts}")
-    async def sub_alias(ts: str):
         if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
             raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
         start_ts = float(ts)
