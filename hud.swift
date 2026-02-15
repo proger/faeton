@@ -252,8 +252,8 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         }
         let filter = SCContentFilter(display: scDisplay, excludingWindows: [])
         let config = SCStreamConfiguration()
-        config.width = max(1, Int(scDisplay.width) / 4)
-        config.height = max(1, Int(scDisplay.height) / 4)
+        config.width = max(1, Int(scDisplay.width) / 2)
+        config.height = max(1, Int(scDisplay.height) / 2)
         config.showsCursor = true
         guard let src = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) else {
             log("pub png skip: captureImage failed (screen recording permission?)")
