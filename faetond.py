@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -82,6 +83,19 @@ def _iter_events_after(events_dir: Path, ts: float):
         except Exception:
             continue
         yield event_ts, payload
+
+
+def _uuid_v1_machine_from_filename(filename: str) -> str | None:
+    name = filename
+    if name.lower().endswith(".png"):
+        name = name[:-4]
+    try:
+        u = uuid.UUID(name)
+    except ValueError:
+        return None
+    if u.version != 1:
+        return None
+    return f"{u.node:012x}"
 
 
 def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
@@ -190,6 +204,33 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 
         updates_ready.set()
         return PlainTextResponse(_format_kv_lines({"ok": "true", "ts": event_ts, "filename": safe_name}))
+
+    @api.get("/png")
+    async def list_latest_pngs_by_machine():
+        store.ensure_dirs()
+        latest_by_node: dict[str, dict[str, str]] = {}
+        for _, payload in _iter_events_after(store.events_dir, 0.0):
+            if payload.get("type") != "png":
+                continue
+            filename = payload.get("filename", "")
+            if not filename:
+                continue
+            node = _uuid_v1_machine_from_filename(filename)
+            if not node:
+                continue
+            latest_by_node[node] = {
+                "node": node,
+                "ts": payload.get("ts", ""),
+                "filename": filename,
+                "url": payload.get("url", f"/png/{filename}"),
+            }
+
+        if not latest_by_node:
+            return PlainTextResponse("")
+
+        rows = sorted(latest_by_node.values(), key=lambda x: x.get("ts", ""), reverse=True)
+        lines = [f"{r['node']} {r['ts']} {r['url']}" for r in rows]
+        return PlainTextResponse("\n".join(lines) + "\n")
 
     @api.get("/png/{filename}")
     async def get_png(filename: str):
