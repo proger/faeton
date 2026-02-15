@@ -1,25 +1,29 @@
-import os
-import time
+#!/usr/bin/env python3
+import argparse
 import asyncio
+import os
 import re
+import time
 from pathlib import Path
 
-import modal
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
-app = modal.App("faetond")
-image = modal.Image.debian_slim().pip_install("fastapi")
-volume = modal.Volume.from_name("faetond-store", create_if_missing=True)
-
-MOUNT_PATH = "/data"
-EVENTS_DIR = Path(MOUNT_PATH) / "events"
-TEXT_DIR = Path(MOUNT_PATH) / "blobs" / "text"
-PNG_DIR = Path(MOUNT_PATH) / "blobs" / "png"
+DEFAULT_DATA_DIR = os.environ.get("FAETOND_DATA_DIR", "./faetond_data")
 
 
-def _ensure_dirs() -> None:
-    EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-    TEXT_DIR.mkdir(parents=True, exist_ok=True)
-    PNG_DIR.mkdir(parents=True, exist_ok=True)
+class Store:
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.events_dir = self.base_dir / "events"
+        self.text_dir = self.base_dir / "blobs" / "text"
+        self.png_dir = self.base_dir / "blobs" / "png"
+        self._write_lock = asyncio.Lock()
+
+    def ensure_dirs(self) -> None:
+        self.events_dir.mkdir(parents=True, exist_ok=True)
+        self.text_dir.mkdir(parents=True, exist_ok=True)
+        self.png_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _now_ts() -> str:
@@ -44,34 +48,22 @@ def _format_kv_lines(payload: dict[str, object]) -> str:
 def _parse_kv_lines(text: str) -> dict[str, str]:
     payload: dict[str, str] = {}
     for raw_line in text.splitlines():
-        if not raw_line.strip():
-            continue
-        if ":" not in raw_line:
+        if not raw_line.strip() or ":" not in raw_line:
             continue
         key, value = raw_line.split(":", 1)
         payload[key.strip()] = value.lstrip().replace("\\n", "\n")
     return payload
 
 
-def _write_event(event: dict) -> str:
-    ts = _now_ts()
-    while (EVENTS_DIR / ts).exists():
-        ts = _now_ts()
-    event_path = EVENTS_DIR / ts
+def _write_event_at_path(event_path: Path, event: dict) -> str:
+    ts = event_path.name
     event["ts"] = ts
     event_path.write_text(_format_kv_lines(event), encoding="utf-8")
     return ts
 
 
-def _write_event_at_ts(event: dict, ts: str) -> str:
-    event_path = EVENTS_DIR / ts
-    event["ts"] = ts
-    event_path.write_text(_format_kv_lines(event), encoding="utf-8")
-    return ts
-
-
-def _iter_events_after(ts: float):
-    for path in sorted(EVENTS_DIR.iterdir(), key=lambda p: float(p.name)):
+def _iter_events_after(events_dir: Path, ts: float):
+    for path in sorted(events_dir.iterdir(), key=lambda p: float(p.name)):
         try:
             event_ts = float(path.name)
         except ValueError:
@@ -85,14 +77,12 @@ def _iter_events_after(ts: float):
         yield event_ts, payload
 
 
-@app.function(image=image, volumes={MOUNT_PATH: volume})
-@modal.asgi_app()
-def web():
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import PlainTextResponse, Response, StreamingResponse
-
-    api = FastAPI()
+def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
+    store = Store(Path(data_dir).resolve())
+    store.ensure_dirs()
     updates_ready = asyncio.Event()
+
+    api = FastAPI(title="faetond")
 
     @api.post("/pub")
     async def post_pub(req: Request):
@@ -106,20 +96,22 @@ def web():
         except UnicodeDecodeError as exc:
             raise HTTPException(status_code=400, detail="text/plain must be utf-8") from exc
 
-        volume.reload()
-        _ensure_dirs()
-        ts = _now_ts()
+        async with store._write_lock:
+            store.ensure_dirs()
+            ts = _now_ts()
+            while (store.events_dir / ts).exists():
+                ts = _now_ts()
 
-        text_path = TEXT_DIR / f"{ts}.txt"
-        text_path.write_text(text, encoding="utf-8")
+            text_path = store.text_dir / f"{ts}.txt"
+            text_path.write_text(text, encoding="utf-8")
 
-        event = {
-            "type": "text",
-            "text": text,
-            "blob": f"blobs/text/{ts}.txt",
-        }
-        event_ts = _write_event(event)
-        volume.commit()
+            event = {
+                "type": "text",
+                "text": text,
+                "blob": f"blobs/text/{ts}.txt",
+            }
+            event_ts = _write_event_at_path(store.events_dir / ts, event)
+
         updates_ready.set()
         return PlainTextResponse(_format_kv_lines({"ok": "true", "ts": event_ts}))
 
@@ -138,21 +130,22 @@ def web():
         except UnicodeDecodeError as exc:
             raise HTTPException(status_code=400, detail="text/plain must be utf-8") from exc
 
-        volume.reload()
-        _ensure_dirs()
-        if (EVENTS_DIR / ts).exists():
-            raise HTTPException(status_code=409, detail="event ts already exists")
+        async with store._write_lock:
+            store.ensure_dirs()
+            event_path = store.events_dir / ts
+            if event_path.exists():
+                raise HTTPException(status_code=409, detail="event ts already exists")
 
-        text_path = TEXT_DIR / f"{ts}.txt"
-        text_path.write_text(text, encoding="utf-8")
+            text_path = store.text_dir / f"{ts}.txt"
+            text_path.write_text(text, encoding="utf-8")
 
-        event = {
-            "type": "text",
-            "text": text,
-            "blob": f"blobs/text/{ts}.txt",
-        }
-        event_ts = _write_event_at_ts(event, ts)
-        volume.commit()
+            event = {
+                "type": "text",
+                "text": text,
+                "blob": f"blobs/text/{ts}.txt",
+            }
+            event_ts = _write_event_at_path(event_path, event)
+
         updates_ready.set()
         return PlainTextResponse(_format_kv_lines({"ok": "true", "ts": event_ts}))
 
@@ -171,22 +164,25 @@ def web():
         if not body:
             raise HTTPException(status_code=400, detail="empty body")
 
-        volume.reload()
-        _ensure_dirs()
+        async with store._write_lock:
+            store.ensure_dirs()
+            png_path = store.png_dir / safe_name
+            png_path.write_bytes(body)
 
-        png_path = PNG_DIR / safe_name
-        png_path.write_bytes(body)
+            ts = _now_ts()
+            while (store.events_dir / ts).exists():
+                ts = _now_ts()
 
-        event = {
-            "type": "png",
-            "filename": safe_name,
-            "url": f"/png/{safe_name}",
-            "blob": f"blobs/png/{safe_name}",
-        }
-        ts = _write_event(event)
-        volume.commit()
+            event = {
+                "type": "png",
+                "filename": safe_name,
+                "url": f"/png/{safe_name}",
+                "blob": f"blobs/png/{safe_name}",
+            }
+            event_ts = _write_event_at_path(store.events_dir / ts, event)
+
         updates_ready.set()
-        return PlainTextResponse(_format_kv_lines({"ok": "true", "ts": ts, "filename": safe_name}))
+        return PlainTextResponse(_format_kv_lines({"ok": "true", "ts": event_ts, "filename": safe_name}))
 
     @api.get("/png/{filename}")
     async def get_png(filename: str):
@@ -195,8 +191,8 @@ def web():
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        volume.reload()
-        png_path = PNG_DIR / safe_name
+        store.ensure_dirs()
+        png_path = store.png_dir / safe_name
         if not png_path.exists():
             raise HTTPException(status_code=404, detail="not found")
 
@@ -206,10 +202,9 @@ def web():
         async def event_stream():
             cursor = start_ts
             while True:
-                volume.reload()
-                _ensure_dirs()
+                store.ensure_dirs()
                 sent_any = False
-                for event_ts, payload in _iter_events_after(cursor):
+                for event_ts, payload in _iter_events_after(store.events_dir, cursor):
                     cursor = max(cursor, event_ts)
                     sent_any = True
                     yield f"id: {payload.get('ts', event_ts)}\n"
@@ -229,11 +224,39 @@ def web():
     async def sub_root():
         return await _sub_impl(0.0)
 
+    @api.get("/sub")
+    async def sub_root_alias():
+        return await _sub_impl(0.0)
+
+    @api.get("/sub/{ts}")
+    async def sub_alias(ts: str):
+        if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
+            raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
+        return await _sub_impl(float(ts))
+
     @api.get("/{ts}")
     async def sub(ts: str):
         if not re.fullmatch(r"\d+(?:\.\d+)?", ts):
             raise HTTPException(status_code=400, detail="ts must be numeric unix timestamp")
-        start_ts = float(ts)
-        return await _sub_impl(start_ts)
+        return await _sub_impl(float(ts))
 
     return api
+
+
+app = create_app()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="faetond local filesystem server")
+    parser.add_argument("--host", default=os.environ.get("FAETOND_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("FAETOND_PORT", "8000")))
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    args = parser.parse_args()
+
+    import uvicorn
+
+    uvicorn.run(create_app(args.data_dir), host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
