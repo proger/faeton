@@ -56,6 +56,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        setupMainMenu()
         setupWindow()
         layout(resetWindowFrame: true)
         setDisplayText("Recording active.")
@@ -136,6 +137,23 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         container.addSubview(scrollView)
         container.addSubview(inputField)
         applyCurrentFonts()
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+
+        let appMenu = NSMenu()
+        let appName = ProcessInfo.processInfo.processName
+        let quitTitle = "Quit \(appName)"
+        appMenu.addItem(
+            withTitle: quitTitle,
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        appItem.submenu = appMenu
+        NSApp.mainMenu = mainMenu
     }
 
     private func updateText(_ text: String, eventID: String? = nil) {
