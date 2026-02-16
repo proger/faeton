@@ -489,10 +489,10 @@ def start_persistent_overlay(chunks_dir, current_microphone):
     proc = subprocess.Popen(
         [
             str(overlay_binary),
-            "--text-file",
+            "-i",
             str(overlay_text_path),
-            "--session-dir",
-            str(chunks_dir),
+            "-o",
+            str(chunks_dir / "_pub.txt"),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

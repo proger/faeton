@@ -6,24 +6,39 @@ import UniformTypeIdentifiers
 import Darwin
 
 struct LaunchConfig {
-    let textFileURL: URL?
+    let inputFileURL: URL?
+    let outputFileURL: URL?
 }
 
 final class OverlayApp: NSObject, NSApplicationDelegate {
+    private let contentSidePad: CGFloat = 8
+    private let contentBottomPad: CGFloat = 10
+    private let transcriptInsetX: CGFloat = 12
+    private let transcriptInsetY: CGFloat = 10
+    private let transcriptLinePadding: CGFloat = 3
+    private let inputInnerLeftApprox: CGFloat = 5
     private let subBaseURL = URL(string: "https://approximate.fit/sub")!
+    private let pubURL = URL(string: "https://approximate.fit/pub")!
     private let config: LaunchConfig
     private let panel = NSPanel(
         contentRect: NSRect(x: 0, y: 0, width: 620, height: 240),
-        styleMask: [.borderless, .nonactivatingPanel],
+        styleMask: [.titled, .resizable, .fullSizeContentView, .nonactivatingPanel],
         backing: .buffered,
         defer: false
     )
-    private let textField = NSTextField(wrappingLabelWithString: "")
-    private let metaField = NSTextField(wrappingLabelWithString: "")
+    private let scrollView = NSScrollView()
+    private let transcriptView = NSTextView()
+    private let inputField = NSTextField(string: "")
     private var captureTimer: Timer?
     private var fileTimer: Timer?
     private var subTask: Task<Void, Never>?
     private var lastText = ""
+    private lazy var timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     init(config: LaunchConfig) {
         self.config = config
@@ -38,10 +53,11 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         setupWindow()
-        layout(text: "Recording active.")
+        layout()
+        setDisplayText("Recording active.")
         panel.orderFrontRegardless()
-        if let textFileURL = config.textFileURL {
-            log("Faeton HUD started in single-player mode. I read overlay text from \(textFileURL.path). Screenshot uploads are disabled.")
+        if let inputFileURL = config.inputFileURL {
+            log("Faeton HUD started in single-player mode. I read overlay text from \(inputFileURL.path). Screenshot uploads are disabled.")
             refreshTextFromFile()
             fileTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 self?.refreshTextFromFile()
@@ -66,95 +82,221 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = false
         panel.hasShadow = true
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.backgroundColor = NSColor.black.withAlphaComponent(0.80)
         panel.isOpaque = false
 
-        textField.textColor = .white
-        textField.font = NSFont(name: "Menlo", size: 16) ?? NSFont.monospacedSystemFont(ofSize: 16, weight: .regular)
-        textField.maximumNumberOfLines = 0
-        textField.lineBreakMode = .byWordWrapping
-        textField.backgroundColor = .clear
-        textField.isBezeled = false
-        textField.isEditable = false
-        textField.isSelectable = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
 
-        metaField.textColor = NSColor.white.withAlphaComponent(0.78)
-        metaField.font = NSFont(name: "Menlo", size: 11) ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        metaField.maximumNumberOfLines = 1
-        metaField.lineBreakMode = .byTruncatingTail
-        metaField.backgroundColor = .clear
-        metaField.isBezeled = false
-        metaField.isEditable = false
-        metaField.isSelectable = false
+        transcriptView.drawsBackground = false
+        transcriptView.isEditable = false
+        transcriptView.isSelectable = true
+        transcriptView.textContainerInset = NSSize(width: transcriptInsetX, height: transcriptInsetY)
+        transcriptView.font = NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        transcriptView.textColor = .white
+        transcriptView.isHorizontallyResizable = false
+        transcriptView.isVerticallyResizable = true
+        transcriptView.autoresizingMask = [.width]
+        transcriptView.textContainer?.lineFragmentPadding = transcriptLinePadding
+        transcriptView.textContainer?.widthTracksTextView = true
+        transcriptView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        transcriptView.textContainer?.heightTracksTextView = false
+        scrollView.documentView = transcriptView
+
+        inputField.font = NSFont(name: "Menlo", size: 12) ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        inputField.placeholderString = "ask:"
+        inputField.isBezeled = true
+        inputField.bezelStyle = .roundedBezel
+        inputField.focusRingType = .none
+        inputField.target = self
+        inputField.action = #selector(handleInputSubmit(_:))
 
         let container = NSView(frame: panel.contentView!.bounds)
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = container
-        container.addSubview(textField)
-        container.addSubview(metaField)
+        scrollView.autoresizingMask = [.width, .height]
+        inputField.autoresizingMask = [.width, .maxYMargin]
+        container.addSubview(scrollView)
+        container.addSubview(inputField)
     }
 
-    private func updateText(_ text: String) {
+    private func updateText(_ text: String, eventID: String? = nil) {
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleaned == lastText { return }
-        lastText = cleaned
-        layout(text: cleaned.isEmpty ? "Recording active." : cleaned)
+        let body = cleaned.isEmpty ? "Recording active." : cleaned
+        if config.inputFileURL != nil {
+            if body == lastText { return }
+            lastText = body
+            setDisplayText(body)
+        } else {
+            appendLogEntry(body, eventID: eventID)
+        }
     }
 
-    private func layout(text: String) {
+    private func layout() {
         let pad: CGFloat = 24
-        let innerPadX: CGFloat = 18
-        let innerPadY: CGFloat = 14
-        let innerGap: CGFloat = 8
-        let metaBottom: CGFloat = 10
         let width: CGFloat = 620
-        let maxHeight = max(220, NSScreen.main?.frame.height ?? 900 - (pad * 2))
-
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let metaLine: String
-        let mainText: String
-        if let last = lines.last,
-           (last.lowercased().hasPrefix("meta:") || last.lowercased().hasPrefix("step:")) {
-            if last.lowercased().hasPrefix("meta:") {
-                metaLine = String(last.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            } else {
-                metaLine = last
-            }
-            mainText = lines.dropLast().joined(separator: "\n")
-        } else {
-            metaLine = ""
-            mainText = text
-        }
-
-        textField.stringValue = mainText
-        metaField.stringValue = metaLine
-        textField.preferredMaxLayoutWidth = width - (innerPadX * 2)
-        metaField.preferredMaxLayoutWidth = width - (innerPadX * 2)
-        let mainFit = textField.fittingSize
-        let metaFit = metaLine.isEmpty ? NSSize(width: 0, height: 0) : metaField.fittingSize
-        let neededHeight = mainFit.height + (innerPadY * 2) + (metaLine.isEmpty ? 0 : (innerGap + metaFit.height + metaBottom))
-        let height = min(max(neededHeight, 220), maxHeight)
+        let height: CGFloat = 280
 
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let x = screenFrame.minX + pad
         let y = screenFrame.minY + ((screenFrame.height - height) / 2)
 
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
-        let metaHeight = metaLine.isEmpty ? 0 : metaFit.height
-        let textBottom = innerPadY + (metaLine.isEmpty ? 0 : (metaBottom + metaHeight + innerGap))
-        textField.frame = NSRect(
-            x: innerPadX,
-            y: textBottom,
-            width: width - (innerPadX * 2),
-            height: max(40, height - textBottom - innerPadY)
+        let bounds = panel.contentView?.bounds ?? NSRect(x: 0, y: 0, width: width, height: height)
+        let gap: CGFloat = 6
+        let inputHeight: CGFloat = 22
+        let transcriptTextLeft = contentSidePad + transcriptInsetX + transcriptLinePadding
+        let inputFrameX = max(contentSidePad, transcriptTextLeft - inputInnerLeftApprox)
+        inputField.frame = NSRect(
+            x: inputFrameX,
+            y: contentBottomPad,
+            width: max(40, bounds.width - inputFrameX - contentSidePad),
+            height: inputHeight
         )
-        metaField.frame = NSRect(
-            x: innerPadX,
-            y: metaBottom,
-            width: width - (innerPadX * 2),
-            height: metaHeight
+        let scrollY = contentBottomPad + inputHeight + gap
+        scrollView.frame = NSRect(
+            x: contentSidePad,
+            y: scrollY,
+            width: max(40, bounds.width - (contentSidePad * 2)),
+            height: max(40, bounds.height - scrollY - contentBottomPad)
         )
+    }
+
+    private func setDisplayText(_ text: String) {
+        let body = text.isEmpty ? "Recording active." : text
+        let renderedBody = body == "Recording active." ? "Recording active.\n" : body
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+
+        let full = NSMutableAttributedString()
+        full.append(NSAttributedString(
+            string: renderedBody,
+            attributes: [
+                .font: NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+        ))
+        transcriptView.textStorage?.setAttributedString(full)
+        let end = NSRange(location: transcriptView.string.count, length: 0)
+        transcriptView.scrollRangeToVisible(end)
+    }
+
+    private func singlePlayerOutputFileURL() -> URL? {
+        if let outputFileURL = config.outputFileURL {
+            return outputFileURL
+        }
+        if let inputFileURL = config.inputFileURL {
+            return inputFileURL.deletingLastPathComponent().appendingPathComponent("_pub.txt")
+        }
+        return nil
+    }
+
+    @objc
+    private func handleInputSubmit(_ sender: NSTextField) {
+        let text = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        sender.stringValue = ""
+        if config.inputFileURL != nil {
+            writePubTextFile(text)
+        } else {
+            postPub(text)
+        }
+    }
+
+    private func writePubTextFile(_ text: String) {
+        guard let fileURL = singlePlayerOutputFileURL() else {
+            log("pub text error: missing output/input file path")
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let line = text + "\n"
+            let data = Data(line.utf8)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                let handle = try FileHandle(forWritingTo: fileURL)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+            } else {
+                try data.write(to: fileURL, options: .atomic)
+            }
+            log("pub text file \(fileURL.path)")
+        } catch {
+            log("pub text error: \(error.localizedDescription)")
+        }
+    }
+
+    private func postPub(_ text: String) {
+        var req = URLRequest(url: pubURL)
+        req.httpMethod = "POST"
+        req.setValue("text/plain", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data(text.utf8)
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+            guard let self else { return }
+            if let error {
+                self.log("pub text error: \(error.localizedDescription)")
+                return
+            }
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if let data, let body = String(data: data, encoding: .utf8), !body.isEmpty {
+                self.log("pub text status=\(code) \(body.trimmingCharacters(in: .whitespacesAndNewlines))")
+            } else {
+                self.log("pub text status=\(code)")
+            }
+        }.resume()
+    }
+
+    private func appendLogEntry(_ text: String, eventID: String?) {
+        let tsString = humanTime(from: eventID) ?? "--:--:--"
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+
+        let line = NSMutableAttributedString()
+        line.append(NSAttributedString(
+            string: "[\(tsString)] ",
+            attributes: [
+                .font: NSFont(name: "Menlo-Bold", size: 13) ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: timestampColor(tsString),
+                .paragraphStyle: paragraph
+            ]
+        ))
+        line.append(NSAttributedString(
+            string: text + "\n",
+            attributes: [
+                .font: NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+        ))
+
+        transcriptView.textStorage?.append(line)
+        let end = NSRange(location: transcriptView.string.count, length: 0)
+        transcriptView.scrollRangeToVisible(end)
+    }
+
+    private func humanTime(from eventID: String?) -> String? {
+        guard let eventID, let seconds = Double(eventID) else { return nil }
+        let d = Date(timeIntervalSince1970: seconds)
+        return timeFormatter.string(from: d)
+    }
+
+    private func timestampColor(_ s: String) -> NSColor {
+        let hue = CGFloat(abs(s.hashValue % 360)) / 360.0
+        return NSColor(calibratedHue: hue, saturation: 0.72, brightness: 0.95, alpha: 1.0)
     }
 
     private func startSubscribeLoop() {
@@ -170,6 +312,32 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     }
 
     private func consumeSSE(url: URL, stopAfterFirstText: Bool) async {
+        var eventId = ""
+        var eventType = ""
+        var eventText = ""
+        var hasText = false
+
+        func flushCurrentEvent() async -> Bool {
+            if eventId.isEmpty && eventType.isEmpty && !hasText {
+                return false
+            }
+            log("sub event id=\(eventId.isEmpty ? "-" : eventId) type=\(eventType.isEmpty ? "-" : eventType)")
+            if hasText {
+                let text = eventText.replacingOccurrences(of: "\\n", with: "\n")
+                log("sub text \(text)")
+                let currentEventID = eventId
+                await MainActor.run { updateText(text, eventID: currentEventID) }
+                if stopAfterFirstText {
+                    return true
+                }
+            }
+            eventId = ""
+            eventType = ""
+            eventText = ""
+            hasText = false
+            return false
+        }
+
         do {
             var req = URLRequest(url: url)
             req.httpMethod = "GET"
@@ -178,32 +346,22 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
             log("sub open \(url.absoluteString)")
             let (bytes, _) = try await URLSession.shared.bytes(for: req)
 
-            var eventId = ""
-            var eventType = ""
-            var eventText = ""
-            var hasText = false
             for try await raw in bytes.lines {
                 if Task.isCancelled { return }
-                let line = raw.trimmingCharacters(in: .newlines)
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 if line.hasPrefix("id:") {
-                    if !eventId.isEmpty || !eventType.isEmpty {
-                        log("sub event id=\(eventId.isEmpty ? "-" : eventId) type=\(eventType.isEmpty ? "-" : eventType)")
+                    if await flushCurrentEvent() {
+                        return
                     }
-                    if hasText {
-                        let text = eventText.replacingOccurrences(of: "\\n", with: "\n")
-                        log("sub text \(text)")
-                        await MainActor.run { updateText(text) }
-                        if stopAfterFirstText {
-                            return
-                        }
-                    }
-                    eventText = ""
-                    hasText = false
                     eventId = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-                    eventType = ""
                     continue
                 }
-                if line.isEmpty { continue }
+                if line.isEmpty {
+                    if await flushCurrentEvent() {
+                        return
+                    }
+                    continue
+                }
                 guard line.hasPrefix("data:") else { continue }
                 let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
                 guard let colon = payload.firstIndex(of: ":") else { continue }
@@ -216,9 +374,14 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
                 if key == "text" {
                     eventText = value
                     hasText = true
+                    if await flushCurrentEvent() {
+                        return
+                    }
                 }
             }
+            _ = await flushCurrentEvent()
         } catch {
+            _ = await flushCurrentEvent()
             log("sub error \(error.localizedDescription)")
         }
     }
@@ -233,8 +396,8 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     }
 
     private func refreshTextFromFile() {
-        guard let textFileURL = config.textFileURL else { return }
-        guard let text = try? String(contentsOf: textFileURL, encoding: .utf8) else { return }
+        guard let inputFileURL = config.inputFileURL else { return }
+        guard let text = try? String(contentsOf: inputFileURL, encoding: .utf8) else { return }
         updateText(text)
     }
 
@@ -360,17 +523,55 @@ private extension NSScreen {
 }
 
 let app = NSApplication.shared
-var textFileURL: URL?
+var inputFileURL: URL?
+var outputFileURL: URL?
+var parseErrors: [String] = []
+
+func printUsage() {
+    let usage = """
+    Usage: faeton [-i <input-file>] [-o <output-file>]
+
+      -i <input-file>   Read overlay text from a local file (single-player mode)
+      -o <output-file>  Append 'ask:' submissions to this local file
+      (no -i)           Multiplayer mode: read live updates from https://approximate.fit/sub/0
+      -h, --help        Show this help
+    """
+    fputs(usage + "\n", stderr)
+}
+
 var i = 1
 while i < CommandLine.arguments.count {
     let arg = CommandLine.arguments[i]
-    if arg == "--text-file", i + 1 < CommandLine.arguments.count {
-        textFileURL = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+    if arg == "-h" || arg == "--help" {
+        printUsage()
+        exit(0)
+    }
+    if arg == "-i", i + 1 < CommandLine.arguments.count {
+        inputFileURL = URL(fileURLWithPath: CommandLine.arguments[i + 1])
         i += 2
         continue
+    } else if arg == "-i" {
+        parseErrors.append("missing value for -i")
+        break
     }
+    if arg == "-o", i + 1 < CommandLine.arguments.count {
+        outputFileURL = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+        i += 2
+        continue
+    } else if arg == "-o" {
+        parseErrors.append("missing value for -o")
+        break
+    }
+    parseErrors.append("unrecognized argument: \(arg)")
     i += 1
 }
-let delegate = OverlayApp(config: LaunchConfig(textFileURL: textFileURL))
+if !parseErrors.isEmpty {
+    for err in parseErrors {
+        fputs("error: \(err)\n", stderr)
+    }
+    printUsage()
+    exit(2)
+}
+let delegate = OverlayApp(config: LaunchConfig(inputFileURL: inputFileURL, outputFileURL: outputFileURL))
 app.delegate = delegate
 app.run()
