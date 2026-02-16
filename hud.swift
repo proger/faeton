@@ -10,7 +10,7 @@ struct LaunchConfig {
     let outputFileURL: URL?
 }
 
-final class OverlayApp: NSObject, NSApplicationDelegate {
+final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let contentSidePad: CGFloat = 8
     private let contentBottomPad: CGFloat = 10
     private let transcriptInsetX: CGFloat = 12
@@ -22,7 +22,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     private let config: LaunchConfig
     private let panel = NSPanel(
         contentRect: NSRect(x: 0, y: 0, width: 620, height: 240),
-        styleMask: [.titled, .resizable, .fullSizeContentView, .nonactivatingPanel],
+        styleMask: [.titled, .resizable, .fullSizeContentView],
         backing: .buffered,
         defer: false
     )
@@ -32,7 +32,11 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     private var captureTimer: Timer?
     private var fileTimer: Timer?
     private var subTask: Task<Void, Never>?
+    private var keyMonitor: Any?
     private var lastText = ""
+    private var mainFontSize: CGFloat = 14
+    private let minMainFontSize: CGFloat = 10
+    private let maxMainFontSize: CGFloat = 42
     private lazy var timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -53,9 +57,10 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         setupWindow()
-        layout()
+        layout(resetWindowFrame: true)
         setDisplayText("Recording active.")
-        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
+        focusInputField()
         if let inputFileURL = config.inputFileURL {
             log("Faeton HUD started in single-player mode. I read overlay text from \(inputFileURL.path). Screenshot uploads are disabled.")
             refreshTextFromFile()
@@ -72,9 +77,11 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        installKeyMonitor()
     }
 
     private func setupWindow() {
+        panel.delegate = self
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.level = .statusBar
@@ -101,7 +108,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         transcriptView.isEditable = false
         transcriptView.isSelectable = true
         transcriptView.textContainerInset = NSSize(width: transcriptInsetX, height: transcriptInsetY)
-        transcriptView.font = NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        transcriptView.font = mainTextFont()
         transcriptView.textColor = .white
         transcriptView.isHorizontallyResizable = false
         transcriptView.isVerticallyResizable = true
@@ -112,7 +119,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         transcriptView.textContainer?.heightTracksTextView = false
         scrollView.documentView = transcriptView
 
-        inputField.font = NSFont(name: "Menlo", size: 12) ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        inputField.font = mainTextFont()
         inputField.placeholderString = "ask:"
         inputField.isBezeled = true
         inputField.bezelStyle = .roundedBezel
@@ -128,6 +135,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         inputField.autoresizingMask = [.width, .maxYMargin]
         container.addSubview(scrollView)
         container.addSubview(inputField)
+        applyCurrentFonts()
     }
 
     private func updateText(_ text: String, eventID: String? = nil) {
@@ -142,19 +150,20 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func layout() {
+    private func layout(resetWindowFrame: Bool = false) {
         let pad: CGFloat = 24
         let width: CGFloat = 620
         let height: CGFloat = 280
 
-        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = screenFrame.minX + pad
-        let y = screenFrame.minY + ((screenFrame.height - height) / 2)
-
-        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        if resetWindowFrame {
+            let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let x = screenFrame.minX + pad
+            let y = screenFrame.minY + ((screenFrame.height - height) / 2)
+            panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        }
         let bounds = panel.contentView?.bounds ?? NSRect(x: 0, y: 0, width: width, height: height)
         let gap: CGFloat = 6
-        let inputHeight: CGFloat = 22
+        let inputHeight: CGFloat = max(22, ceil(mainFontSize + 10))
         let transcriptTextLeft = contentSidePad + transcriptInsetX + transcriptLinePadding
         let inputFrameX = max(contentSidePad, transcriptTextLeft - inputInnerLeftApprox)
         inputField.frame = NSRect(
@@ -182,7 +191,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         full.append(NSAttributedString(
             string: renderedBody,
             attributes: [
-                .font: NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+                .font: mainTextFont(),
                 .foregroundColor: NSColor.white,
                 .paragraphStyle: paragraph
             ]
@@ -269,7 +278,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         line.append(NSAttributedString(
             string: "[\(tsString)] ",
             attributes: [
-                .font: NSFont(name: "Menlo-Bold", size: 13) ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
+                .font: timestampFont(),
                 .foregroundColor: timestampColor(tsString),
                 .paragraphStyle: paragraph
             ]
@@ -277,7 +286,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         line.append(NSAttributedString(
             string: text + "\n",
             attributes: [
-                .font: NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+                .font: mainTextFont(),
                 .foregroundColor: NSColor.white,
                 .paragraphStyle: paragraph
             ]
@@ -393,6 +402,96 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         captureTimer = nil
         subTask?.cancel()
         subTask = nil
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        panel.makeKeyAndOrderFront(nil)
+        focusInputField()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        focusInputField()
+    }
+
+    func windowDidBecomeMain(_ notification: Notification) {
+        focusInputField()
+    }
+
+    private func mainTextFont() -> NSFont {
+        NSFont(name: "Menlo", size: mainFontSize) ?? NSFont.monospacedSystemFont(ofSize: mainFontSize, weight: .regular)
+    }
+
+    private func timestampFont() -> NSFont {
+        let size = max(8, mainFontSize - 1)
+        return NSFont(name: "Menlo-Bold", size: size) ?? NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
+    }
+
+    private func applyCurrentFonts() {
+        transcriptView.font = mainTextFont()
+        inputField.font = mainTextFont()
+    }
+
+    private func restyleTranscriptForCurrentFontSize() {
+        guard let storage = transcriptView.textStorage else {
+            return
+        }
+        let full = NSRange(location: 0, length: storage.length)
+        if full.length == 0 {
+            return
+        }
+        storage.beginEditing()
+        storage.enumerateAttributes(in: full, options: []) { attrs, range, _ in
+            var updated = attrs
+            let color = attrs[.foregroundColor] as? NSColor
+            let isTimestamp = (color != nil) && (color != NSColor.white)
+            updated[.font] = isTimestamp ? timestampFont() : mainTextFont()
+            storage.setAttributes(updated, range: range)
+        }
+        storage.endEditing()
+    }
+
+    private func adjustMainFontSize(by delta: CGFloat) {
+        let next = min(maxMainFontSize, max(minMainFontSize, mainFontSize + delta))
+        if next == mainFontSize {
+            return
+        }
+        mainFontSize = next
+        applyCurrentFonts()
+        restyleTranscriptForCurrentFontSize()
+        layout()
+        scrollTranscriptToBottom()
+    }
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command) else {
+                return event
+            }
+            let chars = event.charactersIgnoringModifiers ?? ""
+            if chars == "=" || chars == "+" || event.keyCode == 69 {
+                self.adjustMainFontSize(by: 1)
+                return nil
+            }
+            if chars == "-" || chars == "_" || event.keyCode == 78 {
+                self.adjustMainFontSize(by: -1)
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func focusInputField() {
+        panel.makeFirstResponder(inputField)
+    }
+
+    private func scrollTranscriptToBottom() {
+        let end = NSRange(location: transcriptView.string.count, length: 0)
+        transcriptView.scrollRangeToVisible(end)
     }
 
     private func refreshTextFromFile() {
@@ -500,14 +599,15 @@ final class OverlayApp: NSObject, NSApplicationDelegate {
         req.setValue("image/png", forHTTPHeaderField: "Content-Type")
         let body = mutable as Data
         log("pub png \(filename) bytes=\(body.count)")
-        URLSession.shared.uploadTask(with: req, from: body) { [weak self] _, response, error in
-            guard let self else { return }
+        URLSession.shared.uploadTask(with: req, from: body) { _, response, error in
             if let error {
-                self.log("pub png error \(filename) \(error.localizedDescription)")
+                print("pub png error \(filename) \(error.localizedDescription)")
+                fflush(stdout)
                 return
             }
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            self.log("pub png done \(filename) status=\(code)")
+            print("pub png done \(filename) status=\(code)")
+            fflush(stdout)
         }.resume()
     }
 
