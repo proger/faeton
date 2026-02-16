@@ -28,6 +28,7 @@ KNOWN_GAME_STATE_FILE = "_known_game_state.txt"
 MULTI_HOST_PROMPT = """You are supporting a Dota 2 team.
 Use the attached screenshot context from multiple hosts.
 You may see your past advice in the top-right HUD overlay; avoid repeating it unless game state changed.
+React directly to the latest player requests recorded in Known game state; prioritize the newest explicit ask.
 Look at the team composition and propose a team tactic to try given items and abilities that they have.
 Prioritise advice how to position the team on the map given information from each team member and current fighting activity.
 Prioritise early-game positioning guidance (lanes, rune control, rotations, vision posture) before mid/late-game macro plans.
@@ -40,7 +41,7 @@ Do not repeat your previous response unless game state changed meaningfully.
 Vary your situation modeling and phrasing across updates; avoid repeating the same framing too often.
 Keep the response very short: exactly 1 sentence.
 Be extremely concise: cap ADVICE to about 8-14 words.
-Use light Gen Z phrasing naturally (e.g., "nah", "lowkey", "hard commit"), but keep it clear and actionable.
+Use mostly plain language; casual slang is optional and should be rare.
 Think fast, latency is important.
 Output format is mandatory:
 ADVICE: <exactly 1 sentence actionable coaching response>
@@ -53,19 +54,67 @@ In NEW GAME STATE, always include the current in-game time (or best visible time
 class Store:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
+        self.games_dir = self.base_dir / "games"
+        self.current_game_file = self.base_dir / "_current_game.txt"
+        self.active_game_id = ""
+        self.game_dir = self.base_dir
         self.events_dir = self.base_dir / "events"
         self.text_dir = self.base_dir / "blobs" / "text"
         self.png_dir = self.base_dir / "blobs" / "png"
         self._write_lock = asyncio.Lock()
 
     def ensure_dirs(self) -> None:
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.games_dir.mkdir(parents=True, exist_ok=True)
+        if not self.active_game_id:
+            game_id = self._read_current_game_id()
+            if not game_id:
+                game_id = _new_game_id()
+            self._set_active_game(game_id)
+            self._write_current_game_id(game_id)
+        self.game_dir.mkdir(parents=True, exist_ok=True)
         self.events_dir.mkdir(parents=True, exist_ok=True)
         self.text_dir.mkdir(parents=True, exist_ok=True)
         self.png_dir.mkdir(parents=True, exist_ok=True)
 
+    def _set_active_game(self, game_id: str) -> None:
+        self.active_game_id = game_id
+        self.game_dir = self.games_dir / game_id
+        self.events_dir = self.game_dir / "events"
+        self.text_dir = self.game_dir / "blobs" / "text"
+        self.png_dir = self.game_dir / "blobs" / "png"
+
+    def _read_current_game_id(self) -> str:
+        if not self.current_game_file.exists():
+            return ""
+        try:
+            game_id = self.current_game_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", game_id):
+            return ""
+        return game_id
+
+    def _write_current_game_id(self, game_id: str) -> None:
+        self.current_game_file.write_text(game_id + "\n", encoding="utf-8")
+
+    def rotate_game(self) -> str:
+        self.ensure_dirs()
+        game_id = _new_game_id()
+        while (self.games_dir / game_id).exists():
+            game_id = _new_game_id()
+        self._set_active_game(game_id)
+        self._write_current_game_id(game_id)
+        self.ensure_dirs()
+        return game_id
+
 
 def _now_ts() -> str:
     return f"{time.time():.6f}"
+
+
+def _new_game_id() -> str:
+    return f"game_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
 def _safe_filename(filename: str) -> str:
@@ -75,12 +124,25 @@ def _safe_filename(filename: str) -> str:
     return base
 
 
+def _client_host(req: Request) -> str:
+    client = req.client
+    if client and client.host:
+        return str(client.host)
+    return ""
+
+
 def _format_kv_lines(payload: dict[str, object]) -> str:
     lines = []
     for key, value in payload.items():
         text = str(value).replace("\n", "\\n")
         lines.append(f"{key}: {text}")
     return "\n".join(lines) + "\n"
+
+
+def _blob_relpath(store: "Store", rel: str) -> str:
+    if store.active_game_id:
+        return f"games/{store.active_game_id}/{rel}"
+    return rel
 
 
 def _parse_kv_lines(text: str) -> dict[str, str]:
@@ -168,21 +230,29 @@ def _run_codex_for_rows(rows: list[dict[str, str]], store: "Store") -> str | Non
         return None
 
     known_game_state = _load_known_game_state(store)
+    pregame_hint = (
+        "\n\nParty size hint:\n"
+        f"{len(rows)} players in party.\n"
+        "Keep advice diverse across updates; include pregame suggestions about picking characters and trying skills.\n"
+    )
     prompt = (
         MULTI_HOST_PROMPT
         + "\n\nMultiplayer host screenshots:\n"
         + "\n".join(context_lines)
+        + pregame_hint
         + f"\n\nKnown game state:\n{known_game_state}\n"
     )
-    codex_dir = store.base_dir / "codex"
+    codex_dir = store.game_dir / "codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
-    codex_log = store.base_dir / "codex.log"
+    codex_log = store.game_dir / "codex.log"
     log_ts = _now_ts()
     prompt_log = codex_dir / f"{log_ts}_prompt.txt"
     response_log = codex_dir / f"{log_ts}_response.txt"
     prompt_log.write_text(prompt, encoding="utf-8")
     cmd = [
         codex_bin,
+        "-a",
+        "never",
         "exec",
         "-m",
         DEFAULT_CODEX_MODEL,
@@ -237,7 +307,95 @@ def _run_codex_for_rows(rows: list[dict[str, str]], store: "Store") -> str | Non
 
 
 def _known_game_state_path(store: "Store") -> Path:
-    return store.base_dir / KNOWN_GAME_STATE_FILE
+    return store.game_dir / KNOWN_GAME_STATE_FILE
+
+
+def _find_png_path(store: "Store", safe_name: str) -> Path | None:
+    current = store.png_dir / safe_name
+    if current.exists():
+        return current
+    legacy = store.base_dir / "blobs" / "png" / safe_name
+    if legacy.exists():
+        return legacy
+    if not store.games_dir.exists():
+        return None
+    for game_dir in sorted(store.games_dir.iterdir(), key=lambda p: p.name, reverse=True):
+        if not game_dir.is_dir():
+            continue
+        candidate = game_dir / "blobs" / "png" / safe_name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _latest_user_requests(store: "Store", limit: int = 6) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for _, payload in _iter_events_after(store.events_dir, 0.0):
+        if payload.get("type") != "text":
+            continue
+        if payload.get("source") != "user":
+            continue
+        text = (payload.get("text") or "").strip()
+        if not text:
+            continue
+        node = (payload.get("node") or "").strip().lower() or "unknown"
+        rows.append({"ts": payload.get("ts", ""), "text": text, "node": node})
+    if limit <= 0:
+        return rows
+    return rows[-limit:]
+
+
+def _latest_png_node_for_client(store: "Store", client_host: str) -> str | None:
+    host = (client_host or "").strip()
+    if not host:
+        return None
+    best: str | None = None
+    for _, payload in _iter_events_after(store.events_dir, 0.0):
+        if payload.get("type") != "png":
+            continue
+        if (payload.get("client") or "").strip() != host:
+            continue
+        node = (payload.get("node") or "").strip().lower()
+        if not node:
+            filename = payload.get("filename", "")
+            node = _uuid_v1_machine_from_filename(filename) or ""
+        if node:
+            best = node
+    return best
+
+
+def _resolve_user_node_tag(req: Request, store: "Store") -> str:
+    by_client = _latest_png_node_for_client(store, _client_host(req))
+    if by_client:
+        return by_client
+    return "unknown"
+
+
+def _latest_user_request_marker(store: "Store") -> str:
+    rows = _latest_user_requests(store, limit=1)
+    if not rows:
+        return ""
+    node = rows[0].get("node", "unknown")
+    ts = rows[0].get("ts", "")
+    text = rows[0].get("text", "").replace("\n", " ").strip()
+    return f"{ts}:{node}:{text[:160]}"
+
+
+def _load_last_full_prompt(store: "Store") -> str:
+    codex_dir = store.game_dir / "codex"
+    if not codex_dir.exists():
+        return "(none yet)"
+    latest_prompt: Path | None = None
+    for path in codex_dir.glob("*_prompt.txt"):
+        if latest_prompt is None or path.name > latest_prompt.name:
+            latest_prompt = path
+    if latest_prompt is None:
+        return "(none yet)"
+    try:
+        text = latest_prompt.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return "(failed to read latest prompt)"
+    return text if text else "(empty prompt)"
 
 
 def _load_known_game_state(store: "Store") -> str:
@@ -282,37 +440,6 @@ def _extract_section(text: str, label: str) -> str:
     if not m:
         return ""
     return m.group(1).strip()
-
-
-def _reset_known_game_state(store: "Store") -> None:
-    path = _known_game_state_path(store)
-    if path.exists():
-        path.unlink()
-
-
-def _reset_text_history(store: "Store") -> int:
-    removed = 0
-    # Remove text events from events dir.
-    for path in sorted(store.events_dir.iterdir(), key=lambda p: float(p.name)):
-        try:
-            payload = _parse_kv_lines(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if payload.get("type") != "text":
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except FileNotFoundError:
-            pass
-
-    # Remove all stored text blobs.
-    for txt in store.text_dir.glob("*.txt"):
-        try:
-            txt.unlink()
-        except FileNotFoundError:
-            pass
-    return removed
 
 
 def _scrub_player_png_history(store: "Store", node: str) -> int:
@@ -369,6 +496,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 
         async with store._write_lock:
             store.ensure_dirs()
+            user_node = _resolve_user_node_tag(req, store)
+            client_host = _client_host(req)
             ts = _now_ts()
             while (store.events_dir / ts).exists():
                 ts = _now_ts()
@@ -379,8 +508,12 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             event = {
                 "type": "text",
                 "text": text,
-                "blob": f"blobs/text/{ts}.txt",
+                "source": "user",
+                "node": user_node,
+                "client": client_host,
+                "blob": _blob_relpath(store, f"blobs/text/{ts}.txt"),
             }
+            _update_known_game_state(store, f"user[{user_node}] request: {text}")
             event_ts = _write_event_at_path(store.events_dir / ts, event)
 
         updates_ready.set()
@@ -403,6 +536,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 
         async with store._write_lock:
             store.ensure_dirs()
+            user_node = _resolve_user_node_tag(req, store)
+            client_host = _client_host(req)
             event_path = store.events_dir / ts
             if event_path.exists():
                 raise HTTPException(status_code=409, detail="event ts already exists")
@@ -413,8 +548,12 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             event = {
                 "type": "text",
                 "text": text,
-                "blob": f"blobs/text/{ts}.txt",
+                "source": "user",
+                "node": user_node,
+                "client": client_host,
+                "blob": _blob_relpath(store, f"blobs/text/{ts}.txt"),
             }
+            _update_known_game_state(store, f"user[{user_node}] request: {text}")
             event_ts = _write_event_at_path(event_path, event)
 
         updates_ready.set()
@@ -439,6 +578,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             store.ensure_dirs()
             png_path = store.png_dir / safe_name
             png_path.write_bytes(body)
+            png_node = _uuid_v1_machine_from_filename(safe_name) or ""
+            client_host = _client_host(req)
 
             ts = _now_ts()
             while (store.events_dir / ts).exists():
@@ -448,8 +589,12 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
                 "type": "png",
                 "filename": safe_name,
                 "url": f"/png/{safe_name}",
-                "blob": f"blobs/png/{safe_name}",
+                "blob": _blob_relpath(store, f"blobs/png/{safe_name}"),
             }
+            if png_node:
+                event["node"] = png_node
+            if client_host:
+                event["client"] = client_host
             event_ts = _write_event_at_path(store.events_dir / ts, event)
 
         updates_ready.set()
@@ -472,8 +617,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         store.ensure_dirs()
-        png_path = store.png_dir / safe_name
-        if not png_path.exists():
+        png_path = _find_png_path(store, safe_name)
+        if png_path is None:
             raise HTTPException(status_code=404, detail="not found")
 
         return Response(content=png_path.read_bytes(), media_type="image/png")
@@ -482,24 +627,22 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
     async def get_state_page():
         store.ensure_dirs()
         rows = _latest_png_rows_by_node(store)
-        known_state = _load_known_game_state(store)
+        last_full_prompt = _load_last_full_prompt(store)
+        current_game_id = store.active_game_id
+        current_game_dir = str(store.game_dir)
         rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
 
         cards = []
         for r in rows:
             url = html.escape(r["url"])
-            node = html.escape(r["node"])
             cards.append(
                 (
-                    "<div style='border:1px solid #ddd;border-radius:8px;padding:10px;margin:8px 0;'>"
+                    "<div class='card'>"
                     f"<div><b>ts:</b> {html.escape(r['ts'])} "
-                    f"<b>node:</b> {node} "
+                    f"<b>node:</b> {html.escape(r['node'])} "
                     f"<b>file:</b> {html.escape(r['filename'])}</div>"
-                    f"<form method='post' action='/scrub/{node}' style='margin-top:6px;'>"
-                    "<button type='submit' style='padding:6px 10px;'>Scrub</button>"
-                    "</form>"
                     f"<div><a href='{url}' target='_blank'>{url}</a></div>"
-                    f"<img src='{url}' style='max-width:100%;height:auto;border:1px solid #ccc;margin-top:8px;' />"
+                    f"<img src='{url}' class='card-image' />"
                     "</div>"
                 )
             )
@@ -509,21 +652,70 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="color-scheme" content="light dark" />
   <title>faetond state</title>
   <style>
-    body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 20px; }}
-    pre {{ background: #f6f8fa; padding: 12px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }}
+    :root {{
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --fg: #111111;
+      --muted: #555555;
+      --card-bg: #ffffff;
+      --card-border: #dddddd;
+      --panel-bg: #f6f8fa;
+      --img-border: #cccccc;
+      --link: #0a58ca;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #0f1115;
+        --fg: #e9edf3;
+        --muted: #a9b3c1;
+        --card-bg: #171b22;
+        --card-border: #2b3240;
+        --panel-bg: #141922;
+        --img-border: #3a4457;
+        --link: #8ab4ff;
+      }}
+    }}
+    body {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin: 20px;
+      background: var(--bg);
+      color: var(--fg);
+    }}
+    a {{ color: var(--link); }}
+    pre {{
+      background: var(--panel-bg);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }}
+    .card {{
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      border-radius: 8px;
+      padding: 10px;
+      margin: 8px 0;
+    }}
+    .card-image {{
+      max-width: 100%;
+      height: auto;
+      border: 1px solid var(--img-border);
+      margin-top: 8px;
+    }}
   </style>
 </head>
 <body>
   <h1>faetond /state</h1>
+  <p><b>Current game:</b> {html.escape(current_game_id)}</p>
+  <p><b>Game directory:</b> {html.escape(current_game_dir)}</p>
   <form method="post" action="/state" style="margin-bottom:16px;">
     <button type="submit" style="padding:8px 12px;">Reset Game</button>
   </form>
   <h2>Prompt</h2>
-  <pre>{html.escape(MULTI_HOST_PROMPT)}</pre>
-  <h2>Known Game State</h2>
-  <pre>{html.escape(known_state)}</pre>
+  <pre>{html.escape(last_full_prompt)}</pre>
   <h2>Players ({len(rows)})</h2>
   {cards_html}
 </body>
@@ -532,11 +724,9 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
 
     @api.post("/state")
     async def reset_game_state():
-        store.ensure_dirs()
-        _reset_text_history(store)
-        _reset_known_game_state(store)
-        # Publish a fresh marker event after reset.
         async with store._write_lock:
+            store.ensure_dirs()
+            store.rotate_game()
             ts = _now_ts()
             while (store.events_dir / ts).exists():
                 ts = _now_ts()
@@ -546,7 +736,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             event = {
                 "type": "text",
                 "text": text,
-                "blob": f"blobs/text/{ts}.txt",
+                "source": "system",
+                "blob": _blob_relpath(store, f"blobs/text/{ts}.txt"),
             }
             _write_event_at_path(store.events_dir / ts, event)
         updates_ready.set()
@@ -615,7 +806,8 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             event = {
                 "type": "text",
                 "text": text,
-                "blob": f"blobs/text/{ts}.txt",
+                "source": "codex",
+                "blob": _blob_relpath(store, f"blobs/text/{ts}.txt"),
             }
             return _write_event_at_path(store.events_dir / ts, event)
 
@@ -625,7 +817,11 @@ def create_app(data_dir: str = DEFAULT_DATA_DIR) -> FastAPI:
             try:
                 store.ensure_dirs()
                 rows = _latest_png_rows_by_node(store)
-                signature = "|".join(f"{r.get('node','')}:{r.get('ts','')}" for r in rows)
+                request_marker = _latest_user_request_marker(store)
+                signature = (
+                    "|".join(f"{r.get('node','')}:{r.get('ts','')}" for r in rows)
+                    + f"|req:{request_marker}"
+                )
                 if rows and signature and signature != last_signature:
                     advice = await asyncio.to_thread(_run_codex_for_rows, rows, store)
                     if advice:
