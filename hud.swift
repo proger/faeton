@@ -11,6 +11,7 @@ struct LaunchConfig {
 }
 
 final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let defaultInputPlaceholder = "ask:"
     private let contentSidePad: CGFloat = 8
     private let contentBottomPad: CGFloat = 10
     private let transcriptInsetX: CGFloat = 12
@@ -121,7 +122,7 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         scrollView.documentView = transcriptView
 
         inputField.font = mainTextFont()
-        inputField.placeholderString = "ask:"
+        inputField.placeholderString = defaultInputPlaceholder
         inputField.isBezeled = true
         inputField.bezelStyle = .roundedBezel
         inputField.focusRingType = .none
@@ -515,7 +516,29 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func refreshTextFromFile() {
         guard let inputFileURL = config.inputFileURL else { return }
         guard let text = try? String(contentsOf: inputFileURL, encoding: .utf8) else { return }
-        updateText(text)
+        let parsed = parseTextFileContent(text)
+        inputField.placeholderString = parsed.metaPlaceholder
+        updateText(parsed.body)
+    }
+
+    private func parseTextFileContent(_ text: String) -> (body: String, metaPlaceholder: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ("", defaultInputPlaceholder)
+        }
+
+        guard let lastNewline = trimmed.lastIndex(of: "\n") else {
+            return (trimmed, defaultInputPlaceholder)
+        }
+
+        let candidateMeta = trimmed[trimmed.index(after: lastNewline)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidateMeta.lowercased().hasPrefix("meta:") {
+            let body = trimmed[..<lastNewline].trimmingCharacters(in: .whitespacesAndNewlines)
+            return (body, candidateMeta)
+        }
+
+        return (trimmed, defaultInputPlaceholder)
     }
 
     private func isDotaFrontmost() -> Bool {
