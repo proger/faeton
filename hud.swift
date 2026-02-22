@@ -571,20 +571,21 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func captureAndUploadIfActive() async {
-        guard let display = NSScreen.main?.displayID else {
-            log("pub png skip: no main display id")
-            return
-        }
-        guard let content = try? await SCShareableContent.current,
-              let scDisplay = content.displays.first(where: { $0.displayID == display }) ?? content.displays.first
-        else {
+        guard let content = try? await SCShareableContent.current else {
             log("pub png skip: SCShareableContent unavailable")
             return
         }
-        let filter = SCContentFilter(display: scDisplay, excludingWindows: [])
+        guard let dotaWindow = content.windows.first(where: {
+            guard let app = $0.owningApplication else { return false }
+            return app.bundleIdentifier == "com.valvesoftware.dota2"
+        }) else {
+            log("pub png skip: dota window not found")
+            return
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: dotaWindow)
         let config = SCStreamConfiguration()
-        config.width = max(1, Int(scDisplay.width) / 2)
-        config.height = max(1, Int(scDisplay.height) / 2)
+        config.width = max(1, Int(dotaWindow.frame.width) / 2)
+        config.height = max(1, Int(dotaWindow.frame.height) / 2)
         config.showsCursor = true
         guard let src = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) else {
             log("pub png skip: captureImage failed (screen recording permission?)")
