@@ -557,6 +557,34 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
+    private func isLikelyDotaApplication(_ app: SCRunningApplication) -> Bool {
+        let bundleID = app.bundleIdentifier.lowercased()
+        if bundleID.contains("dota") {
+            return true
+        }
+        let appName = app.applicationName.lowercased()
+        if appName.contains("dota") {
+            return true
+        }
+        if let running = NSRunningApplication(processIdentifier: app.processID),
+           let exe = running.executableURL?.lastPathComponent.lowercased(),
+           exe.contains("dota") {
+            return true
+        }
+        return false
+    }
+
+    private func isLikelyDotaWindow(_ window: SCWindow) -> Bool {
+        guard let app = window.owningApplication, isLikelyDotaApplication(app) else {
+            return false
+        }
+        // Ignore tiny helper windows and pick the main game render window.
+        if window.frame.width < 640 || window.frame.height < 360 {
+            return false
+        }
+        return true
+    }
+
     private func makeUUIDv1String() -> String {
         var raw: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         uuid_generate_time(&raw)
@@ -571,17 +599,30 @@ final class OverlayApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func captureAndUploadIfActive() async {
-        guard let content = try? await SCShareableContent.current else {
-            log("pub png skip: SCShareableContent unavailable")
-            return
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        } catch {
+            do {
+                content = try await SCShareableContent.current
+            } catch {
+                log("pub png skip: SCShareableContent unavailable")
+                return
+            }
         }
-        guard let dotaWindow = content.windows.first(where: {
-            guard let app = $0.owningApplication else { return false }
-            return app.bundleIdentifier == "com.valvesoftware.dota2"
+
+        let candidates = content.windows.filter { isLikelyDotaWindow($0) }
+        guard let dotaWindow = candidates.max(by: {
+            ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
         }) else {
             log("pub png skip: dota window not found")
             return
         }
+
+        let selectedApp = dotaWindow.owningApplication?.applicationName ?? "-"
+        let selectedTitle = dotaWindow.title ?? "-"
+        log("pub png capture window app=\(selectedApp) title=\(selectedTitle) size=\(Int(dotaWindow.frame.width))x\(Int(dotaWindow.frame.height))")
+
         let filter = SCContentFilter(desktopIndependentWindow: dotaWindow)
         let config = SCStreamConfiguration()
         config.width = max(1, Int(dotaWindow.frame.width) / 2)
