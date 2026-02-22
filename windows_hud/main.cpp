@@ -1633,6 +1633,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = reinterpret_cast<AppState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 
     switch (msg) {
+        case WM_NCHITTEST:
+            // Make the overlay ignore mouse hit-testing so clicks pass through.
+            return HTTRANSPARENT;
         case WM_NCCREATE: {
             auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
             SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
@@ -2103,7 +2106,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     wc.hIconSm = state.appIcon ? state.appIcon : LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
-    DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_APPWINDOW;
+    DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_APPWINDOW | WS_EX_TRANSPARENT;
     DWORD style = WS_POPUP;
 
     float initialWidth = kBaseWindowWidth;
